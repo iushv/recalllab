@@ -1,0 +1,64 @@
+{% extends "base.html" %}
+{% block title %}{{ run.short_id }} &mdash; RecallLab{% endblock %}
+
+{% block tagline %}{% endblock %}
+
+{% block breadcrumb %}
+<div class="breadcrumb"><a href="/">&larr; all runs</a></div>
+{% endblock %}
+
+{% block content %}
+<div class="card {{ run.status_class }}">
+    <div class="nodeid">
+        <span class="pill {{ run.status_class }}">{{ run.status_upper }}</span>
+        {{ run.contract_id }}
+    </div>
+    <div class="meta">
+        provider=<code class="inline">{{ run.provider }}</code>
+        &middot; started {{ run.started_at_human }}
+        {% if run.duration_ms is not none %}
+        &middot; {{ "%.1f"|format(run.duration_ms) }} ms total
+        {% endif %}
+    </div>
+    {% if run.failed_reason %}
+    <div class="reason">{{ run.failed_reason }}</div>
+    {% endif %}
+</div>
+
+{% if run.capability_skips %}
+<h2>Capability gates</h2>
+{% for cs in run.capability_skips %}
+<div class="card skipped">
+    <div class="reason">
+        <code class="inline">{{ cs.capability }}</code> &mdash; {{ cs.reason }}
+    </div>
+</div>
+{% endfor %}
+{% endif %}
+
+<h2>Events <small>({{ run.events|length }})</small></h2>
+{% if run.events %}
+<table class="events">
+    <thead>
+        <tr>
+            <th style="width:3rem">#</th>
+            <th style="width:7rem">kind</th>
+            <th>payload</th>
+            <th class="lat">latency&nbsp;ms</th>
+        </tr>
+    </thead>
+    <tbody>
+    {% for ev in run.events %}
+        <tr class="{{ ev.row_class }}">
+            <td>{{ ev.sequence }}</td>
+            <td class="kind">{{ ev.kind }}</td>
+            <td>{{ ev.payload_summary }}</td>
+            <td class="lat">{% if ev.latency_ms is not none %}{{ "%.2f"|format(ev.latency_ms) }}{% else %}&mdash;{% endif %}</td>
+        </tr>
+    {% endfor %}
+    </tbody>
+</table>
+{% else %}
+<p class="empty">No events recorded for this run.</p>
+{% endif %}
+{% endblock %}

@@ -1,0 +1,60 @@
+{% extends "base.html" %}
+
+{% macro card(run, status_class, status_label) %}
+<div class="card {{ status_class }}">
+    <div class="nodeid">
+        <span class="pill {{ status_class }}">{{ status_label }}</span>
+        {{ run.short_id }}
+    </div>
+    <div class="meta">
+        provider=<code class="inline">{{ run.provider }}</code>
+        &middot; {{ run.events_count }} event{{ run.events_count != 1 and "s" or "" }}
+        &middot; {{ run.started_at_human }}
+    </div>
+    {% if status_class == "failed" and run.failed_reason %}
+    <div class="reason">{{ run.failed_reason }}</div>
+    {% endif %}
+    {% if status_class == "failed" and run.last_recall_query %}
+    <div class="reason">last recall: <code class="inline">{{ run.last_recall_query }}</code></div>
+    {% endif %}
+    {% if status_class == "skipped" %}
+        {% for cs in run.capability_skips %}
+        <div class="reason">
+            <code class="inline">{{ cs.capability }}</code>
+            &middot; N/A &mdash; capability not supported
+        </div>
+        {% else %}
+        <div class="reason">skipped (no capability metadata captured)</div>
+        {% endfor %}
+    {% endif %}
+    <a class="detail-link" href="/runs/{{ run.id }}">view trace &rarr;</a>
+</div>
+{% endmacro %}
+
+{% block content %}
+<h2>Failed <small>({{ failed|length }})</small></h2>
+{% if failed %}
+    {% for r in failed %}{{ card(r, "failed", "FAILED") }}{% endfor %}
+{% else %}
+    <p class="empty">No failed contracts.</p>
+{% endif %}
+
+<h2>Skipped <small>({{ skipped|length }})</small></h2>
+{% if skipped %}
+    {% for r in skipped %}{{ card(r, "skipped", "SKIPPED") }}{% endfor %}
+{% else %}
+    <p class="empty">No skipped contracts.</p>
+{% endif %}
+
+<h2>Passed <small>({{ passed|length }})</small></h2>
+{% if passed %}
+    {% for r in passed %}{{ card(r, "passed", "PASSED") }}{% endfor %}
+{% else %}
+    <p class="empty">No passed contracts.</p>
+{% endif %}
+
+{% if errors %}
+<h2>Errors <small>({{ errors|length }})</small></h2>
+{% for r in errors %}{{ card(r, "error", "ERROR") }}{% endfor %}
+{% endif %}
+{% endblock %}

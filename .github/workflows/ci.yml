@@ -1,0 +1,68 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: tests / py${{ matrix.python-version }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+        with:
+          enable-cache: true
+
+      - name: Pin Python ${{ matrix.python-version }}
+        run: echo "${{ matrix.python-version }}" > .python-version
+
+      - name: Install deps
+        run: uv sync --all-extras --dev
+
+      - name: ruff
+        run: uv run ruff check src/recalllab tests
+
+      - name: mypy --strict
+        run: uv run mypy src/recalllab tests
+
+      - name: pytest
+        run: uv run pytest --no-header -q
+
+  build:
+    name: build wheel + verify package data
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v4
+        with:
+          enable-cache: true
+
+      - name: Install deps
+        run: uv sync
+
+      - name: Build sdist + wheel
+        run: uv build
+
+      - name: Verify dashboard templates ship in the wheel
+        run: |
+          set -eux
+          unzip -l dist/recalllab-*.whl > /tmp/wheel-contents.txt
+          for tpl in base index detail; do
+            grep -q "recalllab/dashboard/templates/${tpl}.html" /tmp/wheel-contents.txt
+          done
+
+      - name: Verify console-script entry point resolves
+        run: uv run --no-sync recalllab --help
