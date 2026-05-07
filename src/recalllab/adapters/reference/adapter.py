@@ -76,6 +76,16 @@ def _tokenize(text: str) -> set[str]:
     return {m.group(0).lower() for m in _TOKEN_PATTERN.finditer(text)}
 
 
+def _metadata_json(metadata: dict[str, Any] | None) -> str | None:
+    if metadata is None:
+        return None
+    return json.dumps(metadata, sort_keys=True, separators=(",", ":"))
+
+
+def _metadata_from_json(metadata_json: str | None) -> dict[str, Any] | None:
+    return json.loads(metadata_json) if metadata_json else None
+
+
 class ReferenceMemoryAdapter:
     """SQLite-backed reference memory provider."""
 
@@ -117,6 +127,9 @@ class ReferenceMemoryAdapter:
             supports_scores=True,
             supports_candidate_trace=True,
             supports_cost_trace=False,
+            supports_custom_episode_ids=True,
+            # SQLite query enumerates every row for the user — authoritative.
+            supports_authoritative_list=True,
         )
 
     def remember(
@@ -127,6 +140,39 @@ class ReferenceMemoryAdapter:
         episode_id: str | None = None,
         metadata: dict[str, Any] | None = None,
     ) -> Episode:
+        # When the caller supplies an explicit episode_id, treat the write
+        # as idempotent: if a row with this id already exists for the same
+        # user with the same text and metadata, return the existing episode unchanged
+        # rather than raising on the PRIMARY KEY constraint. If the id
+        # exists with a *different* user, text, or metadata, that is a real
+        # collision — refuse to silently overwrite stale state.
+        if episode_id is not None:
+            incoming_metadata_json = _metadata_json(metadata)
+            existing = self._con.execute(
+                "SELECT user_id, text, metadata FROM episodes WHERE id = ?",
+                (episode_id,),
+            ).fetchone()
+            if existing is not None:
+                existing_user, existing_text, existing_metadata_json = existing
+                if (
+                    existing_user == user_id
+                    and existing_text == text
+                    and existing_metadata_json == incoming_metadata_json
+                ):
+                    row = self._con.execute(
+                        """
+                        SELECT id, user_id, text, created_at, metadata
+                        FROM episodes WHERE id = ?
+                        """,
+                        (episode_id,),
+                    ).fetchone()
+                    return self._row_to_episode(row)
+                raise ValueError(
+                    f"episode_id {episode_id!r} already exists for user "
+                    f"{existing_user!r}; refusing to overwrite with a "
+                    f"different (user_id, text, metadata). Pass a unique id "
+                    f"or call forget(episode_id=...) first."
+                )
         eid = episode_id or uuid.uuid4().hex
         created_at = datetime.now(tz=UTC)
         self._con.execute(
@@ -139,7 +185,7 @@ class ReferenceMemoryAdapter:
                 user_id,
                 text,
                 created_at.isoformat(),
-                json.dumps(metadata) if metadata is not None else None,
+                _metadata_json(metadata),
             ),
         )
         self._con.commit()
@@ -246,7 +292,7 @@ class ReferenceMemoryAdapter:
                 text=row[1],
                 episode_id=row[0],
                 score=-row[3],  # bm25 lower is better; negate so higher = better
-                metadata=json.loads(row[2]) if row[2] else None,
+                metadata=_metadata_from_json(row[2]),
             )
             for row in rows
         ]
@@ -275,7 +321,7 @@ class ReferenceMemoryAdapter:
                 text=text,
                 episode_id=eid,
                 score=score,
-                metadata=json.loads(meta) if meta else None,
+                metadata=_metadata_from_json(meta),
             )
             for score, eid, text, meta in scored[:k]
         ]
@@ -288,5 +334,5 @@ class ReferenceMemoryAdapter:
             user_id=user_id,
             text=text,
             created_at=datetime.fromisoformat(created_at_iso),
-            metadata=json.loads(metadata_json) if metadata_json else None,
+            metadata=_metadata_from_json(metadata_json),
         )

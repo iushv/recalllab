@@ -28,6 +28,53 @@ class CapabilityFlags(BaseModel):
     supports_scores: bool = False
     supports_candidate_trace: bool = False
     supports_cost_trace: bool = False
+    supports_custom_episode_ids: bool = False
+    # ``list_episodes(user_id)`` returns *every* live episode for the user,
+    # not a best-effort subset. Used by mutation guards that need a real
+    # "does this id still exist?" check (e.g. ``with_stale_repeats``
+    # refusing to resurrect a forgotten source). The MCP adapter defaults
+    # this to ``False`` because its ``list_episodes`` is a wildcard
+    # ``recall`` and many memory servers reject empty queries or cap the
+    # result set; flip it via
+    # ``MCPMemoryConfig.list_episodes_is_authoritative`` only after
+    # verifying against your specific server. Reference + LangGraph
+    # adapters declare it ``True``.
+    supports_authoritative_list: bool = False
+
+
+class UnconfirmedRemoteWriteError(Exception):
+    """Raised by an adapter when an upstream provider may have written but
+    the adapter cannot confirm.
+
+    Canonical case: the configurable MCP adapter sends a custom
+    ``episode_id`` to the remote ``remember`` tool, the server returns a
+    response without the expected id field, and we have no way to tell
+    whether the row landed remotely. The mutation pipeline catches this
+    exception, records the unconfirmed id in the ``MUTATION`` trace
+    event's ``unconfirmed_writes`` list, then re-raises so pytest fails
+    loudly. The Failure Gallery can then show "the contract crashed at
+    this index — your provider may have an orphan row at this id; check
+    it."
+
+    Distinct from plain ``ValueError`` (which adapters raise for
+    pre-write collisions / detected misconfiguration where no remote
+    state changed) because the trace needs to record the requested id —
+    silently dropping it would hide hosted-provider partial failures.
+    """
+
+    def __init__(
+        self,
+        requested_episode_id: str,
+        raw_response: Any = None,
+        message: str = "",
+    ) -> None:
+        super().__init__(
+            message
+            or f"provider may have written at episode_id={requested_episode_id!r} "
+            f"but did not confirm; treat as a possibly-orphaned remote row"
+        )
+        self.requested_episode_id = requested_episode_id
+        self.raw_response = raw_response
 
 
 class Episode(BaseModel):

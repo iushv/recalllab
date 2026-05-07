@@ -122,6 +122,46 @@ type = "reference"      # or "langgraph_store" or "mcp"
 
 All six example contracts pass against all three providers. Capability gating (`@pytest.mark.recalllab_optional("supports_provenance")`) lets contracts skip cleanly when a configured provider lacks a capability — and the skip is persisted to the trace store so the Failure Gallery renders an explicit `N/A — capability not supported` row, not a misleading zero.
 
+## Contract mutations *(v0.2.0)*
+
+Deterministic seeded transformations that stress a contract by polluting
+or amplifying the active user's namespace before the next recall.
+`with_distractors` defaults to `seed=0`, so contracts are reproducible
+without callers having to remember to supply a seed; pass an explicit
+non-zero seed to vary the sample.
+
+Every mutation emits a `MUTATION` trace event with the deterministic
+episode IDs it requested (`mut-{type}-{hash}-{index}`), the `status`
+(`completed` or `partial_failed`), and the captured exception repr on
+failure — so the Failure Gallery shows exactly what was injected, and
+retries against hosted providers (Mem0, Zep, custom MCP) request the
+same IDs rather than silently double-writing with fresh UUIDs.
+
+```python
+def test_birthday_survives_distractors(memory_contract):
+    memory_contract.given_user("ayush")
+    memory_contract.remember("My birthday is December 28.")
+    memory_contract.with_distractors(n=20, seed=7)
+    memory_contract.should_recall("When is my birthday?", contains="December 28")
+
+
+def test_temporal_update_under_stale_repeats(memory_contract):
+    memory_contract.given_user("ayush")
+    memory_contract.remember("I live in Bangalore.")
+    memory_contract.with_stale_repeats(times=3)   # 4 copies of the stale fact
+    memory_contract.remember("Correction: I moved to Mumbai.")
+    memory_contract.should_recall("Where do I live now?", contains="Mumbai")
+```
+
+Both mutations are scoped to the active user — distractors never cross
+into other tenants, repeats never duplicate someone else's facts. On a
+mid-mutation provider exception the trace records the partial set of
+inserted IDs with `status="partial_failed"` and re-raises so the test
+fails loudly. The remaining mutations from the v0.1 plan
+(`with_paraphrases`, `with_tenant_swap`, `with_delete_reinsert`) land in
+v0.2.x once judge-based assertions and the trace-to-test workflow are in
+place.
+
 ## Architecture
 
 ```

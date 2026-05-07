@@ -1,6 +1,6 @@
 [project]
 name = "recalllab"
-version = "0.1.0.dev0"
+version = "0.2.0"
 description = "pytest for agent memory: turn memory expectations into pytest contracts that run in CI."
 readme = "README.md"
 requires-python = ">=3.11"

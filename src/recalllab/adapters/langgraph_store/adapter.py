@@ -17,6 +17,7 @@ adapter forwards through whatever ``score`` the store provides.
 
 from __future__ import annotations
 
+import threading
 import uuid
 from datetime import UTC, datetime
 from typing import Any
@@ -39,6 +40,16 @@ class LangGraphStoreAdapter:
     ) -> None:
         self._store = store
         self._scan_limit = scan_limit
+        # Process-local lock that serialises the get-then-put critical
+        # section of custom-id ``remember`` calls. ``BaseStore`` does not
+        # expose a compare-and-set primitive: without this lock two
+        # concurrent ``remember(..., episode_id=X)`` calls could both see
+        # no existing item and both call ``put``, with the second
+        # silently overwriting the first (last-writer-wins) — defeating
+        # the "different (text, metadata) raises" guarantee. This is
+        # process-local only; cross-process / cross-host shared stores
+        # need application-level coordination on the writer side.
+        self._write_lock = threading.Lock()
         # Conservative defaults: scores/candidate-trace require an indexed
         # store; users with a configured embedding index can opt in.
         self._capabilities = CapabilityFlags(
@@ -48,6 +59,14 @@ class LangGraphStoreAdapter:
             supports_scores=supports_scores,
             supports_candidate_trace=supports_candidate_trace,
             supports_cost_trace=False,
+            # ``BaseStore.put(namespace, key, value)`` writes at the requested
+            # key authoritatively, so RecallLab's mutation idempotency works
+            # against any store that conforms to the protocol.
+            supports_custom_episode_ids=True,
+            # ``BaseStore.search`` with no query enumerates the namespace
+            # bounded by ``scan_limit``; the adapter raises when that bound
+            # is hit so the listing is either authoritative or fails loudly.
+            supports_authoritative_list=True,
         )
 
     # ------------------------------------------------------------ provider API
@@ -62,7 +81,51 @@ class LangGraphStoreAdapter:
         episode_id: str | None = None,
         metadata: dict[str, Any] | None = None,
     ) -> Episode:
-        eid = episode_id or uuid.uuid4().hex
+        # When the caller supplies an explicit episode_id, do a read-before-
+        # write so retries are honest idempotent replays rather than silent
+        # overwrites. ``BaseStore.put`` always overwrites at the requested
+        # key — without this guard a retry would refresh ``created_at`` and
+        # could silently replace a previously-stored value if the deterministic
+        # key collides with a different text/metadata pair across versions.
+        #
+        # The get+put pair runs under ``self._write_lock`` so concurrent
+        # in-process writers cannot race past the existence check and
+        # produce a last-writer-wins overwrite (BaseStore has no CAS
+        # primitive). For multi-process / multi-host shared stores the
+        # caller is responsible for application-level coordination —
+        # noted on the lock attribute.
+        if episode_id is not None:
+            with self._write_lock:
+                existing = self._store.get((user_id,), episode_id)
+                if existing is not None:
+                    return self._idempotent_or_collide(
+                        user_id=user_id,
+                        episode_id=episode_id,
+                        text=text,
+                        metadata=metadata,
+                        existing_value=existing.value,
+                    )
+                return self._do_put(
+                    user_id=user_id,
+                    eid=episode_id,
+                    text=text,
+                    metadata=metadata,
+                )
+        return self._do_put(
+            user_id=user_id,
+            eid=uuid.uuid4().hex,
+            text=text,
+            metadata=metadata,
+        )
+
+    def _do_put(
+        self,
+        *,
+        user_id: str,
+        eid: str,
+        text: str,
+        metadata: dict[str, Any] | None,
+    ) -> Episode:
         created_at = datetime.now(tz=UTC)
         value: dict[str, Any] = {
             "text": text,
@@ -77,6 +140,53 @@ class LangGraphStoreAdapter:
             text=text,
             created_at=created_at,
             metadata=metadata,
+        )
+
+    def _idempotent_or_collide(
+        self,
+        *,
+        user_id: str,
+        episode_id: str,
+        text: str,
+        metadata: dict[str, Any] | None,
+        existing_value: Any,
+    ) -> Episode:
+        """Return the existing episode if it matches; raise on collision.
+
+        Mirrors ``ReferenceMemoryAdapter`` semantics so mutation retry
+        idempotency is a real guarantee across both v0.1 adapters that
+        declare ``supports_custom_episode_ids=True``. Comparison is
+        text + metadata (order-insensitive dict equality); the original
+        ``created_at`` is preserved.
+        """
+        if not isinstance(existing_value, dict):
+            # Defensive: BaseStore should always give us a dict, but if the
+            # store has been bypassed by raw writes we refuse to claim
+            # idempotent replay over an unknown shape.
+            raise ValueError(
+                f"episode_id {episode_id!r} already exists in LangGraph store "
+                f"with non-dict value; refusing to silently overwrite"
+            )
+        existing_text = existing_value.get("text")
+        existing_metadata = existing_value.get("metadata")
+        if existing_text == text and existing_metadata == metadata:
+            existing_created_at_iso = existing_value.get("created_at")
+            created_at = (
+                datetime.fromisoformat(existing_created_at_iso)
+                if isinstance(existing_created_at_iso, str)
+                else datetime.now(tz=UTC)
+            )
+            return Episode(
+                id=episode_id,
+                user_id=user_id,
+                text=text,
+                created_at=created_at,
+                metadata=metadata,
+            )
+        raise ValueError(
+            f"episode_id {episode_id!r} already exists in LangGraph store "
+            f"with different (text, metadata); refusing to silently overwrite. "
+            f"Pass a unique id or call forget(episode_id=...) first."
         )
 
     def recall(
@@ -128,9 +238,26 @@ class LangGraphStoreAdapter:
         return deleted
 
     def list_episodes(self, user_id: str) -> list[Episode]:
-        # list_episodes is best-effort and not tied to forget-compliance,
-        # so we return what we got without raising — but document the bound.
+        # ``list_episodes`` is now part of the liveness oracle for
+        # ``with_stale_repeats`` (gated on ``supports_authoritative_list``).
+        # To make that capability honest, refuse to return a silently
+        # truncated subset: when the scan saturates the configured limit,
+        # the result might be missing a live source episode and the
+        # mutation pipeline could mis-diagnose a real episode as deleted.
+        # Raise loudly so users either raise ``scan_limit`` or accept a
+        # documented failure rather than getting incorrect resurrection
+        # decisions. Matches the existing ``forget(matching=...)`` and
+        # ``delete_user`` semantics on this same adapter.
         items = self._store.search((user_id,), query=None, limit=self._scan_limit)
+        if len(items) >= self._scan_limit:
+            raise RuntimeError(
+                f"list_episodes hit scan_limit={self._scan_limit}; the "
+                f"returned subset is bounded and cannot be treated as an "
+                f"authoritative listing. Increase scan_limit on the adapter "
+                f"(``LangGraphStoreAdapter(store, scan_limit=...)``) before "
+                f"using ``with_stale_repeats`` against namespaces that may "
+                f"exceed the bound."
+            )
         return [self._to_episode(user_id, item) for item in items]
 
     def delete_user(self, user_id: str) -> None:

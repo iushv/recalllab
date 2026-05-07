@@ -23,7 +23,12 @@ from typing import Any, cast
 
 from fastmcp import Client
 
-from recalllab.adapters.base import CapabilityFlags, Episode, Recalled
+from recalllab.adapters.base import (
+    CapabilityFlags,
+    Episode,
+    Recalled,
+    UnconfirmedRemoteWriteError,
+)
 from recalllab.adapters.mcp_configurable.config import MCPMemoryConfig
 
 
@@ -49,6 +54,8 @@ class MCPMemoryAdapter:
             supports_scores=config.recall_score_field is not None,
             supports_candidate_trace=False,
             supports_cost_trace=False,
+            supports_custom_episode_ids=config.honors_custom_episode_ids,
+            supports_authoritative_list=config.list_episodes_is_authoritative,
         )
 
     # ------------------------------------------------------------ provider API
@@ -75,8 +82,52 @@ class MCPMemoryAdapter:
             if isinstance(result, dict)
             else None
         )
-        if not isinstance(eid, str):
-            eid = episode_id or uuid.uuid4().hex
+        if episode_id is not None:
+            # The caller asked us to write at a specific ID — that's the only
+            # contract under which mutation retry idempotency means anything.
+            # The upstream MCP server MUST echo back a string ID at
+            # ``remember_episode_id_field`` so we can verify it honoured the
+            # request. Falling back to ``episode_id`` here would fabricate a
+            # successful verification: the contract DSL's
+            # ``episode.id == requested_id`` check would pass even when the
+            # server silently ignored the supplied ID, and a retry would
+            # double-write hosted memory while the trace falsely recorded the
+            # deterministic requested IDs as inserted.
+            #
+            # We raise ``UnconfirmedRemoteWriteError`` (not plain ValueError)
+            # because the upstream ``remember`` tool was already called —
+            # the row may have landed on the server even though we can't
+            # read back the id. The mutation pipeline records that
+            # possibly-orphaned id in the MUTATION event's
+            # ``unconfirmed_writes`` list before re-raising, so the trace
+            # stays honest about hosted-provider partial failures.
+            if not isinstance(eid, str):
+                raise UnconfirmedRemoteWriteError(
+                    requested_episode_id=episode_id,
+                    raw_response=result,
+                    message=(
+                        f"MCP server returned no string at "
+                        f"{self._config.remember_episode_id_field!r} after a "
+                        f"custom-id remember(episode_id={episode_id!r}). The "
+                        f"upstream remember tool was already invoked, so a row "
+                        f"may have landed remotely under {episode_id!r}; treat "
+                        f"as a possibly-orphaned write. Either the server does "
+                        f"not honour custom episode IDs (in which case leave "
+                        f"honors_custom_episode_ids=False and avoid mutation "
+                        f"usage), or its remember tool's response schema does "
+                        f"not match remember_episode_id_field. Got result: "
+                        f"{result!r}"
+                    ),
+                )
+            # If ``eid`` differs from the requested ``episode_id``, return it
+            # as-is; the mutation pipeline's mismatch check (in dsl.py) will
+            # raise so the trace is honest about what actually landed.
+        elif not isinstance(eid, str):
+            # No custom ID requested and the server didn't return one —
+            # generate a local UUID for the trace. Provenance for non-custom
+            # writes is best-effort here (configure remember_episode_id_field
+            # against a server that returns IDs for true provenance).
+            eid = uuid.uuid4().hex
         return Episode(
             id=eid,
             user_id=user_id,
