@@ -82,11 +82,41 @@ class MemoryContract:
         return self
 
     # ----------------------------------------------------------------- DSL: actions
-    def remember(self, text: str) -> Episode:
-        """Write a memory for the active user."""
+    def remember(self, text: str, *, episode_id: str | None = None) -> Episode:
+        """Write a memory for the active user.
+
+        ``episode_id`` is optional and rarely needed by hand-written
+        contracts — the provider assigns an id by default. It exists for
+        ``recalllab record``-generated regressions: the trace records the
+        exact id the original run produced, and the regenerated test
+        passes it back so any later ``forget(episode_id=...)`` or
+        ID-paired check in the same contract actually addresses the
+        same row. Passing a custom id against an adapter without
+        ``supports_custom_episode_ids`` will not error here but may
+        silently degrade to provider-assigned ids — check the adapter
+        before relying on it.
+
+        ``episode_id`` is forwarded to ``provider.remember`` ONLY when
+        the caller supplied one. Always forwarding it as a keyword
+        would break legacy third-party adapters whose ``remember``
+        signature is ``(user_id, text)`` — every ordinary
+        ``memory_contract.remember("...")`` would raise
+        ``TypeError: unexpected keyword argument 'episode_id'`` even
+        though the new feature isn't being used. The
+        ``MemoryProvider`` Protocol is runtime-checkable and Python's
+        structural typing checks method *names*, not signatures, so a
+        mismatch passes ``isinstance(x, MemoryProvider)`` but fails at
+        call time. Skipping the kwarg in the None case keeps the v0.1
+        provider surface working unchanged — round-11 Codex finding.
+        """
         user_id = self._require_user()
         start = time.perf_counter()
-        episode = self._provider.remember(user_id, text)
+        if episode_id is None:
+            episode = self._provider.remember(user_id, text)
+        else:
+            episode = self._provider.remember(
+                user_id, text, episode_id=episode_id
+            )
         latency_ms = (time.perf_counter() - start) * 1000
         self._record_event(
             EventKind.REMEMBER,

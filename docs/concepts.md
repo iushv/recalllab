@@ -194,6 +194,129 @@ v0.1 plan (``with_paraphrases``, ``with_tenant_swap``,
 ``with_delete_reinsert``) land later in the v0.2 line once the
 trace-to-test and judge stories are in place.
 
+## Trace-to-test *(v0.2.1)*
+
+``recalllab record`` reads a recorded ``ContractRun`` from the SQLite
+trace store and emits a checked-in pytest regression file that replays
+the run. The emitter is a pure transform over the persisted
+``ContractRun`` schema — no LLM, no external API, no provider calls.
+Given a real production failure recorded as a trace, the user gets a
+regression test that reproduces the failure on the next CI run.
+
+### Surface
+
+```bash
+# Pick a specific run by UUID.
+recalllab record --trace .recalllab/traces.sqlite --run-id <uuid> \
+                 --out tests/regressions/test_real_failure.py
+
+# Or pick the most recent failure.
+recalllab record --latest-failure --out tests/regressions/test_real_failure.py
+
+# --force is required to overwrite an existing file at --out.
+```
+
+The output is a self-contained pytest file with a single
+``def test_recorded_failure(memory_contract)`` function that walks
+through the trace's events in order: ``given_user`` → ``remember`` →
+``recall`` / ``should_recall`` → ``forget`` → ``with_distractors`` /
+``with_stale_repeats``.
+
+### Adversarial-input safety
+
+Every value that originated from trace payload data is rendered through
+``repr()`` or a comment-quarantine helper so hostile recall text,
+pytest node IDs, or assertion reasons can't inject code into the
+generated regression. Specifically:
+
+- ``contract_id`` and ``status`` go to ``# Source contract: <!r>`` /
+  ``# Original status: <!r>`` comment lines — never interpolated into
+  the module docstring.
+- DSL arg payloads (``text``, ``query``, ``expected``, ``episode_id``,
+  ``user_id``) go through ``_py()`` (``repr``-based).
+- Multi-line assertion reasons go through ``_safe_comment_lines``,
+  which splits on ``\n`` / ``\r`` and re-prefixes every line with
+  ``#``. A payload-embedded newline can't escape the comment context
+  and turn the next line into executable Python.
+
+Every output is checked with ``compile(source, ..., "exec")`` in the
+test suite — any escape-from-comment regression fails at the syntax
+level, not silently.
+
+### Fidelity guarantees (recorded ⇔ regenerated)
+
+The point of trace-to-test is that the regenerated test actually
+reproduces the original behaviour. Several safeguards make that real
+across non-canonical traces:
+
+- **Recorded ``episode_id`` round-trips.** The DSL's
+  ``remember(text, episode_id=...)`` overload accepts the recorded
+  id; the emitter forwards it. A later ``forget(episode_id=X)`` from
+  the same trace addresses the same row in the regenerated run
+  (round-5 fix).
+- **Capability gating on ``supports_custom_episode_ids``.** Whenever
+  the trace's REMEMBER carries an id, OR whenever it contains a
+  non-``unsupported`` mutation that writes episodes, the generated
+  test is decorated with
+  ``@pytest.mark.recalllab_optional("supports_custom_episode_ids")``
+  so the pytest plugin skips cleanly on providers that don't honour
+  custom IDs (rounds 6 & 9).
+- **``contract_id`` pinning for mutation replay.** Mutation episode
+  IDs (``mut-{type}-{sha256[:16]}-{index:04d}``) are hashed from
+  ``contract_id``. A generated test's pytest nodeid is different from
+  the recorded run's, so without intervention the regenerated
+  mutation would write under different IDs. The emitter prepends
+  ``memory_contract.run.contract_id = '<original>'`` whenever the
+  trace has mutations, so the ``mut-*`` IDs reproduce (round-8 fix).
+- **Synthesised ``given_user`` for incomplete traces.** A trace that
+  starts with REMEMBER / RECALL / FORGET / MUTATION (no preceding
+  GIVEN_USER) or that switches user mid-stream without an explicit
+  GIVEN_USER would otherwise replay under the wrong tenant — or
+  raise ``RuntimeError("no active user")``. The emitter detects
+  this and synthesises a ``given_user`` from the event's payload
+  ``user_id`` with a documenting comment so the developer can audit
+  what was inferred (rounds 7 & 10).
+- **Multi-assert ``should_recall`` preserved.** A
+  ``should_recall(query, contains=X, excludes=Y)`` records ONE
+  RECALL + TWO ASSERT events. The emitter collects every contiguous
+  ASSERT after a RECALL and merges them into one call (round-3 fix);
+  failed-assertion reasons get per-mode labelled comments.
+- **Legacy provider compat.** ``MemoryContract.remember(text)``
+  without ``episode_id`` only forwards the kwarg to the provider
+  when the caller supplied one. v0.1-era third-party adapters whose
+  ``remember`` signature is ``(user_id, text)`` keep working
+  (round-11 fix).
+
+### Reproduction-fidelity caveats
+
+Two cases where the regression file documents but doesn't guarantee
+faithful reproduction:
+
+- ``status="partial_failed"`` mutations replay the call against a
+  fresh adapter. The original failure can have been
+  provider-state-dependent (mid-call disconnect, transient race);
+  the regenerated test may pass or fail with a different shape.
+  The generated file marks this with a ``# NOTE: ... results may
+  diverge ...`` comment so the developer reading it knows the
+  caveat.
+- Recall result *ranking* depends on the provider's retrieval
+  backend (BM25 vs keyword overlap vs embeddings). The rule-based
+  assertions (``contains`` / ``excludes``) survive ranking changes,
+  but the trace's recorded ``results`` array is not replayed
+  against — the regenerated recall re-queries the fresh adapter.
+
+A future ``--strict`` mode (v0.3) may turn either case into a hard
+failure.
+
+### Write safety
+
+The CLI refuses to overwrite an existing file at ``--out`` by
+default; pass ``--force`` to opt in. With ``--force``, the write
+goes through ``tempfile.mkstemp`` + ``os.replace`` in the
+destination's parent directory, so a crash, signal, or disk-full
+event between truncate and the final write can never leave a
+half-written regression in the user's tree (round-4 fix).
+
 ## Providers
 
 A *provider* is anything that implements the tiny ``MemoryProvider``

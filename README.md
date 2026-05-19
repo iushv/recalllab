@@ -65,15 +65,16 @@ RecallLab is the layer underneath the benchmark suites: a pytest plugin that tur
 | Audience | benchmark authors | benchmark authors | researchers | infra teams | **app developers writing CI** |
 | Test format | benchmark dataset | dataset + scenarios | dataset | freeform eval rules | **pytest tests** |
 | pytest-native? | no | no | no | no | **yes (`pytest11`)** |
-| Trace → regression test? | no | no | no | partial | **yes (v0.2)** |
-| Imports other benchmarks? | n/a | n/a | n/a | n/a | **yes (v0.2)** |
+| Trace → regression test? | no | no | no | partial | **yes (`recalllab record`, v0.2.1)** |
+| Contract mutations? | no | no | no | no | **yes (`with_distractors`, `with_stale_repeats`, v0.2.0)** |
+| Imports other benchmarks? | n/a | n/a | n/a | n/a | **yes (v0.2.x)** |
 
 The wedge: RecallLab is **the test runner**, not the test corpus.
 
 ## Quickstart
 
 ```bash
-# Install (until v0.1.0 lands on PyPI)
+# Install (until v0.2 lands on PyPI)
 pip install "git+https://github.com/iushv/recalllab.git"
 
 # Scaffold tests/memory/ + recalllab.toml
@@ -91,6 +92,15 @@ recalllab dashboard          # serves localhost:8080
 ```
 
 The Failure Gallery groups runs by status (failed → skipped → passed), shows the failed assertion reason and last recall query on each card, and links to a per-run detail page rendering the full ordered event trace (`given_user → remember → recall → assert`) with per-event latency.
+
+To turn a recorded failure into a checked-in pytest regression *(v0.2.1)*:
+
+```bash
+recalllab record --latest-failure --out tests/regressions/test_real_failure.py
+pytest tests/regressions/test_real_failure.py     # reproduces the CI failure
+```
+
+The emitter is a pure transform over the persisted `ContractRun` — byte-stable, no LLM, no external API. Every payload value goes through `repr()` or a comment-quarantine helper so hostile recall text / pytest node IDs / assertion reasons can't inject code into the generated test file. Recorded episode IDs round-trip into the generated test, so any later `forget(episode_id=X)` from the original run actually targets the same row in the regenerated one (no silent no-ops). Refuses to overwrite an existing file unless `--force` is passed, and uses atomic-write (`tempfile.mkstemp` + `os.replace`) when overwriting is permitted so a crash mid-write can't leave a half-written regression in your tree.
 
 ## Six failure-mode categories
 
@@ -183,18 +193,18 @@ your tests/memory/                                 your provider
 
 ## Status
 
-**v0.1** ships:
-- pytest plugin + DSL with `contains` / `excludes` rule-based assertion modes
-- 3 provider adapters (`reference`, `langgraph_store`, `mcp_configurable`)
-- Failure Gallery dashboard, lazy-imported via `[dashboard]` extra
-- 27 tests · mypy `--strict` clean · ruff clean · CI on push and PR
-- Adversarial review passed; the four findings caught are locked behind regression tests in [`tests/unit/test_codex_review_regressions.py`](tests/unit/test_codex_review_regressions.py)
+**v0.1** — pytest plugin + DSL with `contains` / `excludes` rule-based assertions, three adapters (`reference`, `langgraph_store`, `mcp_configurable`), Failure Gallery dashboard, 27 tests. Adversarial review passed; the four findings caught are locked behind regression tests in [`tests/unit/test_codex_review_regressions.py`](tests/unit/test_codex_review_regressions.py).
 
-**v0.2** roadmap (see [`CHANGELOG.md`](CHANGELOG.md)):
-- Trace-to-test generation: `recalllab record --trace ... --out test_real_failure.py`
+**v0.2.0** — contract mutations: `with_distractors(n, *, seed=0)` and `with_stale_repeats(*, times)`. Deterministic episode IDs, partial-failure tracing, capability gate for `supports_custom_episode_ids`, two-layered resurrection guard, in-flight fingerprint map for retry idempotency. **Twelve rounds** of adversarial review against the mutation system; every finding has a regression test.
+
+**v0.2.1** — trace-to-test generation: `recalllab record --trace <path> --run-id <id> --out test.py` (or `--latest-failure`). Reads a recorded `ContractRun` from the SQLite trace store and emits a self-contained pytest regression file that replays the contract. Safe against hostile payloads (every interpolation site uses `repr()` or comment-quarantine). Recorded episode IDs round-trip into the generated test so ID-paired `forget` / capability-checked recall actually addresses the same row in the regenerated run. Atomic write via temp-file + `os.replace` with default refuse-to-overwrite; `--force` to opt in. Reference adapter is now thread-safe in-process (`threading.Lock` + `check_same_thread=False`, mirroring the round-12 LangGraph pattern). Five rounds of adversarial review.
+
+**v0.2.x roadmap** (see [`CHANGELOG.md`](CHANGELOG.md)):
 - Judge-driven assertions: `latest_fact_is`, `must_not_answer_as`, `judge_assertion`
-- Contract mutations: `with_distractors`, `with_paraphrases`, `with_stale_repeats`
 - Benchmark importers: LongMemEval, LoCoMo, MemoryAgentBench → contract DSL
+- pgvector / embedding-based reference adapter
+
+**Gates** — 154 tests · mypy `--strict` clean · ruff clean · CI matrix py3.11/3.12 + wheel build verification.
 
 ## Docs
 

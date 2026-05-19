@@ -12,7 +12,7 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
 
-from recalllab.core.traces.schema import ContractRun
+from recalllab.core.traces.schema import ContractRun, RunStatus
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS runs (
@@ -89,3 +89,29 @@ class TraceStore:
                 (limit,),
             ).fetchall()
         return [ContractRun.model_validate_json(r[0]) for r in rows]
+
+    def get_latest_run_by_status(self, status: RunStatus) -> ContractRun | None:
+        """Return the most recent run matching ``status``, or ``None`` if none exist.
+
+        Uses the ``idx_runs_status`` + ``idx_runs_started_at`` indexes so the
+        search is bounded by the result, not by the size of the store. A
+        previous paginate-and-filter implementation could silently miss
+        older failed runs once a trace store accumulated more than 200
+        passed runs since the last failure — the kind of bug that only
+        bites in long-lived CI environments. ``recalllab record
+        --latest-failure`` calls this directly.
+        """
+        with self._connect() as con:
+            row = con.execute(
+                """
+                SELECT data
+                FROM runs
+                WHERE status = ?
+                ORDER BY started_at DESC
+                LIMIT 1
+                """,
+                (status.value,),
+            ).fetchone()
+        if row is None:
+            return None
+        return ContractRun.model_validate_json(row[0])

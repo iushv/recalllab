@@ -200,3 +200,116 @@ def test_mcp_extract_flat_path_still_works() -> None:
     """Backwards compatibility with the simple-key case."""
     payload = {"results": ["a", "b"]}
     assert MCPMemoryAdapter._extract(payload, "results") == ["a", "b"]
+
+
+# ------------------------------------------ round-11: legacy provider compat
+def test_memory_contract_remember_works_against_legacy_provider() -> None:
+    """``MemoryContract.remember`` must NOT forward ``episode_id`` to
+    the provider when the caller didn't supply one.
+
+    Round-11 Codex finding: the round-5 round-trip fix made
+    ``MemoryContract.remember(text)`` always call
+    ``provider.remember(user_id, text, episode_id=...)``. Legacy
+    third-party adapters written against the v0.1 protocol surface
+    have ``remember(user_id, text)`` and don't accept the keyword —
+    every ordinary ``memory_contract.remember("...")`` raised
+    ``TypeError: unexpected keyword argument 'episode_id'``. The
+    ``MemoryProvider`` Protocol is ``runtime_checkable`` but Python's
+    structural typing only checks method *names*, not signatures, so
+    a legacy adapter passes ``isinstance(x, MemoryProvider)`` and
+    then fails at call time.
+    """
+    from datetime import UTC, datetime
+    from typing import Any
+    from uuid import uuid4
+
+    from recalllab.adapters.base import CapabilityFlags, Episode
+    from recalllab.core.contract.dsl import MemoryContract
+    from recalllab.core.traces.schema import ContractRun
+
+    class _LegacyProvider:
+        """v0.1-style adapter — accepts ``(user_id, text)`` ONLY."""
+
+        def __init__(self) -> None:
+            self._episodes: list[Episode] = []
+
+        def capabilities(self) -> CapabilityFlags:
+            return CapabilityFlags(supports_forget=True)
+
+        # Crucially: NO ``episode_id`` / ``metadata`` keyword arguments.
+        # Any caller that forwards them unconditionally TypeErrors.
+        def remember(self, user_id: str, text: str) -> Episode:
+            ep = Episode(
+                id=uuid4().hex,
+                user_id=user_id,
+                text=text,
+                created_at=datetime.now(tz=UTC),
+            )
+            self._episodes.append(ep)
+            return ep
+
+        def recall(self, user_id: str, query: str, *, k: int = 5) -> list[Any]:
+            return []
+
+        def forget(
+            self,
+            user_id: str,
+            *,
+            matching: str | None = None,
+            episode_id: str | None = None,
+        ) -> int:
+            return 0
+
+        def list_episodes(self, user_id: str) -> list[Episode]:
+            return list(self._episodes)
+
+        def delete_user(self, user_id: str) -> None:
+            return None
+
+    provider = _LegacyProvider()
+    run = ContractRun(
+        id=uuid4().hex,
+        contract_id="tests/x::test_legacy_compat",
+        provider="legacy",
+        started_at=datetime.now(tz=UTC),
+    )
+    contract = MemoryContract(provider, run)
+    contract.given_user("ayush")
+    # Ordinary remember — caller passed no episode_id. This must NOT
+    # raise. Pre-fix it raised TypeError on the very first call.
+    ep = contract.remember("I live in Mumbai.")
+    assert ep.text == "I live in Mumbai."
+    assert ep.user_id == "ayush"
+
+
+def test_memory_contract_remember_forwards_episode_id_when_supplied() -> None:
+    """The kwarg IS forwarded when the caller supplied it — that's the
+    round-5 round-trip path. We just don't force the keyword on legacy
+    providers when no id was requested. A modern provider (the
+    reference adapter) must still receive the id and use it.
+    """
+    from datetime import UTC, datetime
+    from uuid import uuid4
+
+    from recalllab.adapters.reference import ReferenceMemoryAdapter
+    from recalllab.core.contract.dsl import MemoryContract
+    from recalllab.core.traces.schema import ContractRun
+
+    adapter = ReferenceMemoryAdapter()
+    try:
+        run = ContractRun(
+            id=uuid4().hex,
+            contract_id="unit::dsl_compat",
+            provider="reference",
+            started_at=datetime.now(tz=UTC),
+        )
+        contract = MemoryContract(adapter, run)
+        contract.given_user("ayush")
+        ep = contract.remember("I live in Mumbai.", episode_id="cust-1")
+        assert ep.id == "cust-1"
+        # The reference adapter stored it at the requested id.
+        eps = adapter.list_episodes("ayush")
+        assert len(eps) == 1
+        assert eps[0].id == "cust-1"
+    finally:
+        adapter.close()

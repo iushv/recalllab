@@ -6,6 +6,13 @@ back to an in-process keyword-overlap retriever otherwise. Declares all
 capability flags True — provenance, scores, forget, tenant-delete, and
 candidate trace are all natively supported, so all six v0.1 example
 contracts run green against it.
+
+The adapter uses one persistent SQLite connection so ``:memory:`` stores
+behave like a single store for the adapter lifetime. Connection access is
+serialized by a process-local lock and SQLite is opened with
+``check_same_thread=False`` so callers may use the same adapter instance from
+multiple threads. Cross-process coordination is out of scope; callers sharing
+a file-backed database across processes need application-level coordination.
 """
 
 from __future__ import annotations
@@ -13,6 +20,7 @@ from __future__ import annotations
 import json
 import re
 import sqlite3
+import threading
 import uuid
 from datetime import UTC, datetime
 from pathlib import Path
@@ -93,13 +101,15 @@ class ReferenceMemoryAdapter:
         if path != ":memory:":
             Path(path).parent.mkdir(parents=True, exist_ok=True)
         self.path = path
-        self._con = sqlite3.connect(path)
+        self._lock = threading.Lock()
+        self._con = sqlite3.connect(path, check_same_thread=False)
         self._fts5 = _FTS5_AVAILABLE
         self._init_schema()
 
     # ------------------------------------------------------------------ lifecycle
     def close(self) -> None:
-        self._con.close()
+        with self._lock:
+            self._con.close()
 
     def __enter__(self) -> ReferenceMemoryAdapter:
         return self
@@ -113,10 +123,11 @@ class ReferenceMemoryAdapter:
         self.close()
 
     def _init_schema(self) -> None:
-        self._con.executescript(_BASE_SCHEMA)
-        if self._fts5:
-            self._con.executescript(_FTS5_SCHEMA)
-        self._con.commit()
+        with self._lock:
+            self._con.executescript(_BASE_SCHEMA)
+            if self._fts5:
+                self._con.executescript(_FTS5_SCHEMA)
+            self._con.commit()
 
     # ----------------------------------------------------------------- protocol
     def capabilities(self) -> CapabilityFlags:
@@ -142,60 +153,68 @@ class ReferenceMemoryAdapter:
     ) -> Episode:
         # When the caller supplies an explicit episode_id, treat the write
         # as idempotent: if a row with this id already exists for the same
-        # user with the same text and metadata, return the existing episode unchanged
-        # rather than raising on the PRIMARY KEY constraint. If the id
-        # exists with a *different* user, text, or metadata, that is a real
-        # collision — refuse to silently overwrite stale state.
-        if episode_id is not None:
-            incoming_metadata_json = _metadata_json(metadata)
-            existing = self._con.execute(
-                "SELECT user_id, text, metadata FROM episodes WHERE id = ?",
-                (episode_id,),
-            ).fetchone()
-            if existing is not None:
-                existing_user, existing_text, existing_metadata_json = existing
-                if (
-                    existing_user == user_id
-                    and existing_text == text
-                    and existing_metadata_json == incoming_metadata_json
-                ):
-                    row = self._con.execute(
-                        """
-                        SELECT id, user_id, text, created_at, metadata
-                        FROM episodes WHERE id = ?
-                        """,
-                        (episode_id,),
-                    ).fetchone()
-                    return self._row_to_episode(row)
-                raise ValueError(
-                    f"episode_id {episode_id!r} already exists for user "
-                    f"{existing_user!r}; refusing to overwrite with a "
-                    f"different (user_id, text, metadata). Pass a unique id "
-                    f"or call forget(episode_id=...) first."
-                )
-        eid = episode_id or uuid.uuid4().hex
-        created_at = datetime.now(tz=UTC)
-        self._con.execute(
-            """
-            INSERT INTO episodes (id, user_id, text, created_at, metadata)
-            VALUES (?, ?, ?, ?, ?)
-            """,
-            (
-                eid,
-                user_id,
-                text,
-                created_at.isoformat(),
-                _metadata_json(metadata),
-            ),
-        )
-        self._con.commit()
-        return Episode(
-            id=eid,
-            user_id=user_id,
-            text=text,
-            created_at=created_at,
-            metadata=metadata,
-        )
+        # user with the same text and metadata, return the existing episode
+        # unchanged rather than raising on the PRIMARY KEY constraint. If
+        # the id exists with a *different* user, text, or metadata, that's
+        # a real collision — refuse to silently overwrite stale state.
+        #
+        # The whole SELECT-then-INSERT runs under ``self._lock`` so two
+        # concurrent in-process callers racing the same id can't both pass
+        # the existence check and both insert. SQLite's PRIMARY KEY would
+        # catch the duplicate INSERT at commit time, but the lock keeps the
+        # idempotent-replay vs collision-raise semantics deterministic
+        # (matches the round-12 LangGraph pattern).
+        with self._lock:
+            if episode_id is not None:
+                incoming_metadata_json = _metadata_json(metadata)
+                existing = self._con.execute(
+                    "SELECT user_id, text, metadata FROM episodes WHERE id = ?",
+                    (episode_id,),
+                ).fetchone()
+                if existing is not None:
+                    existing_user, existing_text, existing_metadata_json = existing
+                    if (
+                        existing_user == user_id
+                        and existing_text == text
+                        and existing_metadata_json == incoming_metadata_json
+                    ):
+                        row = self._con.execute(
+                            """
+                            SELECT id, user_id, text, created_at, metadata
+                            FROM episodes WHERE id = ?
+                            """,
+                            (episode_id,),
+                        ).fetchone()
+                        return self._row_to_episode(row)
+                    raise ValueError(
+                        f"episode_id {episode_id!r} already exists for user "
+                        f"{existing_user!r}; refusing to overwrite with a "
+                        f"different (user_id, text, metadata). Pass a unique id "
+                        f"or call forget(episode_id=...) first."
+                    )
+            eid = episode_id or uuid.uuid4().hex
+            created_at = datetime.now(tz=UTC)
+            self._con.execute(
+                """
+                INSERT INTO episodes (id, user_id, text, created_at, metadata)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    eid,
+                    user_id,
+                    text,
+                    created_at.isoformat(),
+                    _metadata_json(metadata),
+                ),
+            )
+            self._con.commit()
+            return Episode(
+                id=eid,
+                user_id=user_id,
+                text=text,
+                created_at=created_at,
+                metadata=metadata,
+            )
 
     def recall(
         self,
@@ -206,9 +225,10 @@ class ReferenceMemoryAdapter:
     ) -> list[Recalled]:
         if not query.strip():
             return []
-        if self._fts5:
-            return self._recall_fts5(user_id, query, k)
-        return self._recall_fallback(user_id, query, k)
+        with self._lock:
+            if self._fts5:
+                return self._recall_fts5(user_id, query, k)
+            return self._recall_fallback(user_id, query, k)
 
     def forget(
         self,
@@ -219,47 +239,57 @@ class ReferenceMemoryAdapter:
     ) -> int:
         if episode_id is None and matching is None:
             raise ValueError("forget requires either matching= or episode_id=")
-        if episode_id is not None:
+        with self._lock:
+            if episode_id is not None:
+                cursor = self._con.execute(
+                    "DELETE FROM episodes WHERE user_id = ? AND id = ?",
+                    (user_id, episode_id),
+                )
+                self._con.commit()
+                return cursor.rowcount
+            # Match-mode: do NOT pass user input through SQL LIKE — '%' and
+            # '_' would act as wildcards, so matching='%' would delete every
+            # memory for the user. Filter literally in Python, then delete
+            # by id. The whole scan-then-delete runs under the lock so a
+            # concurrent ``remember`` matching the substring can't slip in
+            # between the SELECT and the DELETE and survive.
+            assert matching is not None  # narrowed by the early-return above
+            needle = matching.lower()
+            candidates = self._con.execute(
+                "SELECT id, text FROM episodes WHERE user_id = ?",
+                (user_id,),
+            ).fetchall()
+            ids_to_delete = [
+                eid for eid, text in candidates if needle in text.lower()
+            ]
+            if not ids_to_delete:
+                return 0
+            placeholders = ",".join("?" * len(ids_to_delete))
             cursor = self._con.execute(
-                "DELETE FROM episodes WHERE user_id = ? AND id = ?",
-                (user_id, episode_id),
+                f"DELETE FROM episodes WHERE user_id = ? AND id IN ({placeholders})",
+                (user_id, *ids_to_delete),
             )
             self._con.commit()
             return cursor.rowcount
-        # Match-mode: do NOT pass user input through SQL LIKE — '%' and '_'
-        # would act as wildcards, so matching='%' would delete every memory
-        # for the user. Filter literally in Python, then delete by id.
-        assert matching is not None  # narrowed by the early-return above
-        needle = matching.lower()
-        candidates = self._con.execute(
-            "SELECT id, text FROM episodes WHERE user_id = ?",
-            (user_id,),
-        ).fetchall()
-        ids_to_delete = [eid for eid, text in candidates if needle in text.lower()]
-        if not ids_to_delete:
-            return 0
-        placeholders = ",".join("?" * len(ids_to_delete))
-        cursor = self._con.execute(
-            f"DELETE FROM episodes WHERE user_id = ? AND id IN ({placeholders})",
-            (user_id, *ids_to_delete),
-        )
-        self._con.commit()
-        return cursor.rowcount
 
     def list_episodes(self, user_id: str) -> list[Episode]:
-        rows = self._con.execute(
-            """
-            SELECT id, user_id, text, created_at, metadata
-            FROM episodes WHERE user_id = ?
-            ORDER BY created_at ASC
-            """,
-            (user_id,),
-        ).fetchall()
+        with self._lock:
+            rows = self._con.execute(
+                """
+                SELECT id, user_id, text, created_at, metadata
+                FROM episodes WHERE user_id = ?
+                ORDER BY created_at ASC
+                """,
+                (user_id,),
+            ).fetchall()
         return [self._row_to_episode(row) for row in rows]
 
     def delete_user(self, user_id: str) -> None:
-        self._con.execute("DELETE FROM episodes WHERE user_id = ?", (user_id,))
-        self._con.commit()
+        with self._lock:
+            self._con.execute(
+                "DELETE FROM episodes WHERE user_id = ?", (user_id,)
+            )
+            self._con.commit()
 
     # ----------------------------------------------------------------- internals
     def _recall_fts5(self, user_id: str, query: str, k: int) -> list[Recalled]:
