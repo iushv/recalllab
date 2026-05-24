@@ -501,7 +501,14 @@ def _emit_should_recall(
     for assert_event in assert_events:
         mode = assert_event.payload.get("mode", "")
         expected = assert_event.payload.get("expected")
-        passed = bool(assert_event.payload.get("passed", True))
+        # ``passed`` is three-valued from v0.2.2: True / False / None.
+        # ``None`` is a short-circuit placeholder (Decision #9) and must NOT
+        # be reported as a failure. A missing ``passed`` key (legacy traces)
+        # defaults to True; anything that round-trips a literal ``None``
+        # stays ``None``. Don't ``bool()`` here — that would coerce ``None``
+        # into ``False`` and falsely flag placeholders as failures.
+        passed_raw = assert_event.payload.get("passed", True)
+        passed: bool | None = None if passed_raw is None else bool(passed_raw)
         reason = assert_event.payload.get("reason")
         reason_text = reason if isinstance(reason, str) else None
         if mode == "contains":
@@ -513,7 +520,7 @@ def _emit_should_recall(
             # Don't track unknown-mode pass/fail as a "failed" assertion
             # because the emitter doesn't render the call anyway.
             continue
-        if not passed:
+        if passed is False:
             failed_assertions.append(_FailedAssertion(mode, expected, reason_text))
 
     if contains_expected is _UNSET and excludes_expected is _UNSET:

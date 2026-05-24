@@ -833,12 +833,28 @@ class MemoryContract:
     def _record_assertion(
         self,
         *,
-        passed: bool,
+        passed: bool | None,
         mode: str,
         expected: object,
         actual: str,
         reason: str | None = None,
+        cost_estimate: dict[str, Any] | None = None,
     ) -> None:
+        """Record one assertion's outcome on both the assertions list and the trace.
+
+        ``passed=True`` / ``False`` represent evaluated outcomes. ``passed=None``
+        is a placeholder for an assertion that was *not evaluated* — used by
+        Decision #9 short-circuit (``docs/judge-assertions.md``): when a
+        combined rule + judge call fails on the rule-based side, the judge
+        side records a placeholder so ``recalllab record`` can faithfully
+        regenerate the original call with both kwargs intact. The run
+        status only flips to FAILED when ``passed is False``; placeholders
+        do not count as failures.
+
+        ``cost_estimate`` carries the judge-call accounting payload for
+        judge-mode ASSERTs (see ``TraceEvent`` docstring); rule-based
+        ASSERTs leave it ``None``.
+        """
         seq = self._next_sequence()
         self._run.assertions.append(
             AssertionResult(
@@ -861,9 +877,13 @@ class MemoryContract:
                     "reason": reason,
                 },
                 timestamp=datetime.now(tz=UTC),
+                cost_estimate=cost_estimate,
             )
         )
-        if not passed:
+        # Only true failures flip the run status. ``passed=None`` is a
+        # short-circuit placeholder (Decision #9) and must not be counted
+        # as a failure — ``if not passed:`` would silently catch it.
+        if passed is False:
             self._run.status = RunStatus.FAILED
 
     def _assert_contains(self, actual: str, expected: str | list[str]) -> None:

@@ -30,6 +30,13 @@ provider = "none"             # set to "anthropic" to enable judge-based
                               # Requires the [judge] extra:
                               #   pip install 'recalllab[judge]'
                               # and ANTHROPIC_API_KEY in the environment.
+# max_cost_usd = 0.10         # per-contract judge spend cap (defaults to $0.10).
+# max_session_cost_usd = 1.00 # per-pytest-invocation cap; bounds CI spend
+                              # across the whole suite (defaults to $1.00).
+                              # Both caps are enforced post-call: an in-flight
+                              # invocation (incl. retry) completes; the next
+                              # invocation refuses to start. Under pytest-xdist
+                              # the session cap is per-worker until v0.3.
 
 # [provider.mcp]              # populated only when provider.type = "mcp"
 # server_url = "..."

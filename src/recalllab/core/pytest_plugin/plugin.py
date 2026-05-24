@@ -38,7 +38,17 @@ from recalllab.core.traces.sqlite_store import TraceStore
 _DEFAULT_CONFIG: dict[str, dict[str, Any]] = {
     "provider": {"type": "reference"},
     "trace": {"path": ".recalllab/traces.sqlite"},
-    "judge": {"provider": "none"},
+    "judge": {
+        "provider": "none",
+        # Per-run cap: bounds one contract's judge spend. Default 10 cents.
+        # See docs/judge-assertions.md §Cost & budget.
+        "max_cost_usd": 0.10,
+        # Per-pytest-session cap: bounds total judge spend across every
+        # contract in one ``pytest`` invocation. The cap that matters for
+        # CI. Default $1.00. Under pytest-xdist, this is per-worker (a v0.3
+        # follow-up tracks cross-worker aggregation).
+        "max_session_cost_usd": 1.00,
+    },
 }
 
 _CONFIG_KEY: pytest.StashKey[dict[str, dict[str, Any]]] = pytest.StashKey()
