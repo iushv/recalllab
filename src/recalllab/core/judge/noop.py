@@ -30,6 +30,20 @@ class NoOpJudge(JudgeProvider):
     (``docs/judge-assertions.md``).
     """
 
+    @property
+    def model_name(self) -> str:
+        # Sentinel — DSL will never invoke evaluate() against NoOpJudge
+        # in normal flow because capabilities().available is False.
+        return "noop"
+
+    @property
+    def max_cost_usd(self) -> float:
+        # Infinite per-run cap because NoOpJudge never bills. The DSL
+        # gate fires before any cost-bearing call would happen, so this
+        # sentinel ensures the DSL's "is this call over the per-run
+        # cap?" check never fires on a NoOpJudge contract.
+        return float("inf")
+
     def capabilities(self) -> JudgeCapabilities:
         return JudgeCapabilities(available=False)
 

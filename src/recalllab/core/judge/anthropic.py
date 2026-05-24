@@ -141,6 +141,15 @@ class AnthropicJudge(JudgeProvider):
 
     # ------------------------------------------------------ read-only state
     @property
+    def model_name(self) -> str:
+        """Pinned model identifier used in every ``messages.create`` call.
+
+        Copied into ``JudgeRequest.model`` by the DSL so the request's
+        identity tuple matches the prompt the judge actually uses.
+        """
+        return self._model
+
+    @property
     def session_cost_usd(self) -> float:
         """Running judge spend for the current pytest session."""
         return self._session_cost_usd

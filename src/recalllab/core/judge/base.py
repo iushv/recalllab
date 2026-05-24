@@ -150,13 +150,24 @@ class JudgeRequest(BaseModel):
     a small integer hard-coded in the prompt-builder module and bumped
     whenever the template changes in a verdict-affecting way; v0.2.2
     ships at version 1.
+
+    ``expected`` semantics by mode:
+
+    - ``latest_fact_is`` — a single string; the value asserted as the
+      current answer.
+    - ``must_not_answer_as`` — a list of strings; values that must NOT
+      be asserted as current.
+    - ``judge_assertion`` — ``None``; the rubric criterion lives in
+      ``rubric`` instead. (``None`` is the cleanest way to signal "no
+      expected literal" without a sentinel like ``""`` that misleads
+      readers and matches the docstring above.)
     """
 
     model_config = ConfigDict(frozen=True)
 
     query: str
     recall_result: str
-    expected: str | list[str]
+    expected: str | list[str] | None = None
     rubric: str | None = None  # The Rubric.criterion text (not the Rubric instance).
     model: str
     mode: JudgeMode
@@ -186,12 +197,40 @@ class JudgeVerdict(BaseModel):
 class JudgeProvider(Protocol):
     """Minimal contract every judge backend implements.
 
-    Two methods only: ``capabilities()`` for the fail-loud gate, and
-    ``evaluate(request)`` for the actual judging. Real backends
-    implement ``evaluate`` against a remote API; ``NoOpJudge`` always
-    raises ``JudgeUnavailableError`` from ``evaluate`` because the gate
-    should have caught the call before it got here.
+    Two methods plus two properties:
+
+    - ``capabilities()`` drives the fail-loud gate.
+    - ``evaluate(request)`` actually judges.
+    - ``model_name`` is the model identifier the DSL copies into
+      every ``JudgeRequest`` it builds (so the request's identity
+      tuple matches the prompt the judge will actually use).
+    - ``max_cost_usd`` is the per-``ContractRun`` cap the DSL enforces
+      before calling ``evaluate``. The session cap lives on the
+      judge instance because session state is naturally per-judge.
+
+    ``NoOpJudge`` returns sentinel values (``"noop"`` and ``inf``) for
+    the properties since its ``evaluate`` never runs in normal flow.
+
+    **Implementer contract (important for v0.2.3 verdict caching):**
+    providers SHOULD use ``request.model`` and
+    ``request.prompt_template_version`` to drive the prompt they send,
+    not values stored on the provider instance. If a provider's
+    ``model_name`` and ``request.model`` ever disagree (they don't in
+    v0.2.2 because the DSL copies one from the other), the request
+    wins — that's what the cache key will hash. Same for
+    ``prompt_template_version``: if a provider uses a different
+    template than the version it accepts in the request, the cache
+    will return stale verdicts. ``AnthropicJudge`` in v0.2.2 honors
+    both by construction (it pins both at init and the DSL passes the
+    same values back), so the contract is currently trivially met;
+    third-party providers must respect it explicitly.
     """
+
+    @property
+    def model_name(self) -> str: ...
+
+    @property
+    def max_cost_usd(self) -> float: ...
 
     def capabilities(self) -> JudgeCapabilities: ...
 

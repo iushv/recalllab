@@ -4,14 +4,18 @@ The fixture exposed by the pytest plugin is an instance of ``MemoryContract``.
 Each call records a ``TraceEvent`` on the underlying ``ContractRun`` so the
 full conversation is debuggable from the Failure Gallery.
 
-v0.1 ships rule-based assertion modes (``contains`` / ``excludes``) only;
-the judge-driven modes (``latest_fact_is``, ``must_not_answer_as``,
-``judge_assertion``) land in a follow-up task and are gated on a configured
-``[judge]`` section in ``recalllab.toml``.
+Rule-based modes (``contains`` / ``excludes``) work with the default
+``[judge].provider = "none"``. Judge-driven modes (``latest_fact_is``,
+``must_not_answer_as``, ``judge_assertion``) require ``[judge]`` to be
+configured (``recalllab.toml`` ``provider = "anthropic"`` + the
+``[judge]`` extra + ``ANTHROPIC_API_KEY``); without it the DSL raises
+``JudgeUnavailableError`` (Decision #3b). See
+``docs/judge-assertions.md`` for the full design.
 """
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import time
 from datetime import UTC, datetime
@@ -21,11 +25,16 @@ import pytest
 
 from recalllab.adapters.base import UnconfirmedRemoteWriteError
 from recalllab.core.judge import (
+    JudgeBudgetExceededError,
+    JudgeMode,
+    JudgePartialFailureError,
     JudgeProvider,
+    JudgeRequest,
     JudgeUnavailableError,
     NoOpJudge,
     Rubric,
 )
+from recalllab.core.judge.prompts import JUDGE_PROMPT_TEMPLATE_VERSION
 from recalllab.core.mutations import sample_distractors, validate_seed
 from recalllab.core.traces.schema import (
     AssertionResult,
@@ -54,6 +63,7 @@ class MemoryContract:
         *,
         judge: JudgeProvider | None = None,
         judge_optional: bool = False,
+        judge_always_run: bool = False,
     ) -> None:
         self._provider = provider
         self._run = run
@@ -66,6 +76,14 @@ class MemoryContract:
         # whether the gate skips or raises. Set by the pytest fixture; unit
         # tests can flip it directly.
         self._judge_optional = judge_optional
+        # Diagnostic mode (Decision #9): when true, the judge runs even
+        # after a preceding rule-based assertion failed. The judge
+        # verdict NEVER overrides the rule-based AssertionError for
+        # pytest reporting; the original failure still wins. Default
+        # false so the standard short-circuit + placeholder semantics
+        # apply. See docs/judge-assertions.md "always_run x budget
+        # precedence".
+        self._judge_always_run = judge_always_run
         self._user_id: str | None = None
         self._sequence = 0
         # Counter for mutation invocations, used as part of the deterministic
@@ -703,10 +721,13 @@ class MemoryContract:
         ``@pytest.mark.recalllab_optional("judge_configured")``, in which
         case the call short-circuits to ``pytest.skip``.
 
-        v0.2.2 step 2 ships the signature + gate but NOT the judge
-        evaluation logic — calling a judge mode against a configured judge
-        currently raises ``NotImplementedError``. Step 4 lands the
-        ``AnthropicJudge`` adapter.
+        Judge-mode kwargs are evaluated by the configured judge backend
+        (see ``[judge]`` in ``recalllab.toml`` — v0.2.2 ships
+        ``AnthropicJudge``). The judge call's cost is recorded on the
+        ASSERT row's ``cost_estimate`` field and aggregated into
+        ``ContractRun.judge_cost_usd``. ``raw_responses`` from the judge
+        live in the ASSERT row's payload for debuggability per
+        ``docs/judge-assertions.md`` §Failed-judge ASSERT lifecycle.
         """
         # Decision #3a: at most one judge-mode kwarg per call.
         active_judge_modes = [
@@ -739,17 +760,68 @@ class MemoryContract:
         joined = "\n".join(r.text for r in results)
 
         # Decision #9: rule-based assertions evaluate FIRST with fail-fast.
-        # A failing rule-based assertion raises AssertionError here and
-        # the judge code below never runs — which means the fail-loud gate
-        # also never fires. That's intentional: a contract whose
-        # rule-based assertion already failed should report the rule-based
-        # failure, not the judge-availability error. The behavior is
-        # identical regardless of whether the judge is configured, so
-        # CI can reproduce the failure even when [judge] = "none".
-        if contains is not None:
-            self._assert_contains(joined, contains)
-        if excludes is not None:
-            self._assert_excludes(joined, excludes)
+        # A failing rule-based assertion raises AssertionError before any
+        # judge call. When a judge mode is also present in the call:
+        #
+        # - Default (always_run=false): emit a placeholder ASSERT row
+        #   (passed=None) so the trace records the full intent and
+        #   `recalllab record` can faithfully regenerate the original
+        #   combined call. No judge cost is incurred.
+        #
+        # - Diagnostic mode (always_run=true): invoke the judge anyway
+        #   so users can compare judge-vs-rule agreement across the
+        #   suite. The judge ASSERT row is real (passed True or False),
+        #   cost is billed, but the rule-based AssertionError is still
+        #   the one pytest reports — the judge verdict never overrides
+        #   the rule-based failure. This is the always_run x budget
+        #   precedence locked in Decision #9.
+        try:
+            if contains is not None:
+                self._assert_contains(joined, contains)
+            if excludes is not None:
+                self._assert_excludes(joined, excludes)
+        except AssertionError:
+            if active_judge_modes:
+                judge_kwarg = active_judge_modes[0]
+                if (
+                    self._judge_always_run
+                    and self._judge.capabilities().available
+                ):
+                    # Diagnostic run: invoke the judge so the ASSERT row
+                    # carries a real verdict + cost. The judge's own
+                    # AssertionError (if FAIL or judge_api_error) is
+                    # suppressed so the rule-based failure remains the
+                    # reported error per Decision #9 always_run x budget
+                    # precedence.
+                    with contextlib.suppress(AssertionError):
+                        self._evaluate_judge_mode(
+                            query=query,
+                            joined=joined,
+                            judge_kwarg=judge_kwarg,
+                            latest_fact_is=latest_fact_is,
+                            must_not_answer_as=must_not_answer_as,
+                            judge_assertion=judge_assertion,
+                        )
+                else:
+                    # Placeholder path — judge not invoked.
+                    expected_value = self._judge_expected_for(
+                        judge_kwarg,
+                        latest_fact_is=latest_fact_is,
+                        must_not_answer_as=must_not_answer_as,
+                        judge_assertion=judge_assertion,
+                    )
+                    self._record_assertion(
+                        passed=None,
+                        mode=judge_kwarg,
+                        expected=expected_value,
+                        actual=joined,
+                        reason=(
+                            "short_circuited: preceding rule-based "
+                            "assertion failed; judge not invoked "
+                            "(Decision #9)"
+                        ),
+                    )
+            raise
 
         # Decision #3b: fail-loud gate runs AFTER rule-based assertions
         # pass. Codex finding (round-3 adversarial on step 2): placing the
@@ -777,18 +849,192 @@ class MemoryContract:
             )
 
         if active_judge_modes:
-            # Step 2 plumbing only: judge evaluation logic lands in step 4.
-            # The gate above already proves the judge is configured, so
-            # raising NotImplementedError here is honest — we have a
-            # capable judge but no code yet to drive it.
-            raise NotImplementedError(
-                f"judge mode {active_judge_modes[0]!r} evaluation lands "
-                f"in v0.2.2 step 4 (AnthropicJudge adapter). v0.2.2 step "
-                f"2 ships the protocol, the [judge] config wiring, and "
-                f"the fail-loud gate only."
+            judge_kwarg = active_judge_modes[0]
+            self._evaluate_judge_mode(
+                query=query,
+                joined=joined,
+                judge_kwarg=judge_kwarg,
+                latest_fact_is=latest_fact_is,
+                must_not_answer_as=must_not_answer_as,
+                judge_assertion=judge_assertion,
             )
 
         return results
+
+    # ---------------------------------------------------------- judge internals
+    @staticmethod
+    def _judge_expected_for(
+        judge_kwarg: str,
+        *,
+        latest_fact_is: str | None,
+        must_not_answer_as: list[str] | None,
+        judge_assertion: Rubric | None,
+    ) -> object:
+        """Return the "expected" value to record on a judge-mode ASSERT row.
+
+        For ``latest_fact_is`` / ``must_not_answer_as`` it's the literal
+        kwarg value; for ``judge_assertion`` it's the full ``Rubric``
+        model (the trace stores both labels per §Rubric class identity).
+        """
+        if judge_kwarg == "latest_fact_is":
+            return latest_fact_is
+        if judge_kwarg == "must_not_answer_as":
+            return must_not_answer_as
+        if judge_kwarg == "judge_assertion":
+            return judge_assertion
+        raise RuntimeError(f"unreachable: unknown judge_kwarg {judge_kwarg!r}")
+
+    @staticmethod
+    def _judge_mode_for(judge_kwarg: str) -> JudgeMode:
+        return {
+            "latest_fact_is": JudgeMode.LATEST_FACT_IS,
+            "must_not_answer_as": JudgeMode.MUST_NOT_ANSWER_AS,
+            "judge_assertion": JudgeMode.JUDGE_ASSERTION,
+        }[judge_kwarg]
+
+    @staticmethod
+    def _judge_envelope_expected(
+        judge_kwarg: str,
+        *,
+        latest_fact_is: str | None,
+        must_not_answer_as: list[str] | None,
+        judge_assertion: Rubric | None,
+    ) -> str | list[str] | None:
+        """Return the value that goes into ``JudgeRequest.expected``.
+
+        ``judge_assertion`` carries its criterion in ``rubric`` (the
+        labels stay local to the trace); its ``expected`` slot is
+        ``None`` — explicitly "no expected literal" rather than an
+        empty-string sentinel that would mislead readers.
+        """
+        if judge_kwarg == "latest_fact_is":
+            assert latest_fact_is is not None
+            return latest_fact_is
+        if judge_kwarg == "must_not_answer_as":
+            assert must_not_answer_as is not None
+            return must_not_answer_as
+        if judge_kwarg == "judge_assertion":
+            return None
+        raise RuntimeError(f"unreachable: unknown judge_kwarg {judge_kwarg!r}")
+
+    def _evaluate_judge_mode(
+        self,
+        *,
+        query: str,
+        joined: str,
+        judge_kwarg: str,
+        latest_fact_is: str | None,
+        must_not_answer_as: list[str] | None,
+        judge_assertion: Rubric | None,
+    ) -> None:
+        """Build the JudgeRequest, enforce per-run cap, evaluate, record.
+
+        Raises ``AssertionError`` when the verdict is FAIL; pytest then
+        reports the contract as failed. Other ``Judge*Error`` exceptions
+        are partially caught so trace state stays consistent:
+
+        - ``JudgeUnavailableError`` (initial-call API error): no cost
+          incurred; propagate. The DSL gate already screened the
+          NoOpJudge case, so this only fires on real network/API
+          failures from a configured judge — pytest reports ERROR.
+        - ``JudgePartialFailureError`` (retry-call API error after the
+          initial call billed): record a failed-judge ASSERT carrying
+          the realized cost, then re-raise as AssertionError so pytest
+          reports failure. The user paid for the partial call; the
+          trace must record it.
+        - ``JudgeBudgetExceededError`` (session cap from the judge, or
+          per-run cap from this DSL): propagate. No ASSERT row recorded
+          because no API call was issued.
+        """
+        expected_value_for_trace = self._judge_expected_for(
+            judge_kwarg,
+            latest_fact_is=latest_fact_is,
+            must_not_answer_as=must_not_answer_as,
+            judge_assertion=judge_assertion,
+        )
+
+        # Per-run budget gate (the per-session gate lives on the judge
+        # itself). Same post-call overshoot semantics: if the running
+        # ContractRun total has reached the per-run cap, the NEXT
+        # invocation refuses.
+        max_per_run = self._judge.max_cost_usd
+        if self._run.judge_cost_usd >= max_per_run:
+            raise JudgeBudgetExceededError(
+                f"per-run judge cost cap reached for this contract: "
+                f"${self._run.judge_cost_usd:.4f} >= ${max_per_run:.4f}. "
+                "Raise [judge].max_cost_usd in recalllab.toml or split "
+                "this contract into smaller pieces."
+            )
+
+        request = JudgeRequest(
+            query=query,
+            recall_result=joined,
+            expected=self._judge_envelope_expected(
+                judge_kwarg,
+                latest_fact_is=latest_fact_is,
+                must_not_answer_as=must_not_answer_as,
+                judge_assertion=judge_assertion,
+            ),
+            rubric=(
+                judge_assertion.criterion
+                if judge_assertion is not None
+                else None
+            ),
+            model=self._judge.model_name,
+            mode=self._judge_mode_for(judge_kwarg),
+            prompt_template_version=JUDGE_PROMPT_TEMPLATE_VERSION,
+        )
+
+        try:
+            verdict = self._judge.evaluate(request)
+        except JudgePartialFailureError as exc:
+            # Retry API error after the initial call billed. Bill the
+            # cost on the trace and record a failed-judge ASSERT, then
+            # raise AssertionError so pytest reports failure.
+            self._run.judge_cost_usd += exc.cost.estimated_usd
+            self._record_assertion(
+                passed=False,
+                mode=judge_kwarg,
+                expected=expected_value_for_trace,
+                actual=joined,
+                reason=f"judge_api_error: {exc}",
+                cost_estimate=exc.cost.model_dump(),
+                # raw_responses lives on the ASSERT payload per
+                # docs/judge-assertions.md §Failed-judge ASSERT
+                # lifecycle, not inside cost_estimate (which is pure
+                # accounting).
+                extra_payload={"raw_responses": exc.raw_responses},
+            )
+            raise AssertionError(
+                f"judge mode {judge_kwarg!r} failed: judge_api_error "
+                f"after retry; partial cost billed; see trace ASSERT row "
+                f"raw_responses for the malformed initial response"
+            ) from exc
+
+        # Successful verdict (PASS or FAIL) — bill cost and record the
+        # ASSERT row. raw_responses live on the payload (not inside
+        # cost_estimate) per the documented schema.
+        self._run.judge_cost_usd += verdict.cost.estimated_usd
+        extra_payload: dict[str, Any] | None = (
+            {"raw_responses": verdict.raw_responses}
+            if verdict.raw_responses
+            else None
+        )
+        self._record_assertion(
+            passed=verdict.passed,
+            mode=judge_kwarg,
+            expected=expected_value_for_trace,
+            actual=joined,
+            reason=verdict.reason or None,
+            cost_estimate=verdict.cost.model_dump(),
+            extra_payload=extra_payload,
+        )
+
+        if not verdict.passed:
+            raise AssertionError(
+                f"judge mode {judge_kwarg!r} returned FAIL: "
+                f"{verdict.reason or '(no reason supplied by judge)'}"
+            )
 
     # ---------------------------------------------------------------- internal API
     def _last_remember_for(self, user_id: str) -> TraceEvent | None:
@@ -839,6 +1085,7 @@ class MemoryContract:
         actual: str,
         reason: str | None = None,
         cost_estimate: dict[str, Any] | None = None,
+        extra_payload: dict[str, Any] | None = None,
     ) -> None:
         """Record one assertion's outcome on both the assertions list and the trace.
 
@@ -866,16 +1113,22 @@ class MemoryContract:
                 sequence=seq,
             )
         )
+        payload: dict[str, Any] = {
+            "mode": mode,
+            "expected": expected,
+            "passed": passed,
+            "reason": reason,
+        }
+        if extra_payload:
+            # Judge-mode ASSERTs add ``raw_responses`` here per
+            # docs/judge-assertions.md §Failed-judge ASSERT lifecycle.
+            # The accounting payload (``cost_estimate``) stays clean.
+            payload.update(extra_payload)
         self._run.events.append(
             TraceEvent(
                 sequence=seq,
                 kind=EventKind.ASSERT,
-                payload={
-                    "mode": mode,
-                    "expected": expected,
-                    "passed": passed,
-                    "reason": reason,
-                },
+                payload=payload,
                 timestamp=datetime.now(tz=UTC),
                 cost_estimate=cost_estimate,
             )

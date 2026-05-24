@@ -48,6 +48,14 @@ _DEFAULT_CONFIG: dict[str, dict[str, Any]] = {
         # CI. Default $1.00. Under pytest-xdist, this is per-worker (a v0.3
         # follow-up tracks cross-worker aggregation).
         "max_session_cost_usd": 1.00,
+        # Diagnostic mode: when true, the judge runs even after a
+        # preceding rule-based assertion failed (so users can compare
+        # judge vs rule-based agreement across the suite). The judge
+        # verdict NEVER overrides the rule-based failure for pytest
+        # reporting; the rule-based AssertionError still wins. See
+        # docs/judge-assertions.md Decision #9 always_run x budget
+        # precedence. Default false so normal cost-protection holds.
+        "always_run": False,
     },
 }
 
@@ -445,11 +453,13 @@ def memory_contract(
         and marker.args[0] == "judge_configured"
         for marker in request.node.iter_markers("recalllab_optional")
     )
+    judge_always_run = bool(config["judge"].get("always_run", False))
     contract = MemoryContract(
         recalllab_provider,
         run,
         judge=judge,
         judge_optional=judge_optional,
+        judge_always_run=judge_always_run,
     )
 
     # Walk every recalllab_optional marker, resolve via the capability
