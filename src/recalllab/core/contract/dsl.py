@@ -735,9 +735,30 @@ class MemoryContract:
                 "judge_assertion="
             )
 
-        # Decision #3b: fail-loud gate for judge modes against an
-        # unconfigured judge. Runs BEFORE any recall query so contracts
-        # that error here don't accidentally write to the trace store.
+        results = self.recall(query, k=k)
+        joined = "\n".join(r.text for r in results)
+
+        # Decision #9: rule-based assertions evaluate FIRST with fail-fast.
+        # A failing rule-based assertion raises AssertionError here and
+        # the judge code below never runs — which means the fail-loud gate
+        # also never fires. That's intentional: a contract whose
+        # rule-based assertion already failed should report the rule-based
+        # failure, not the judge-availability error. The behavior is
+        # identical regardless of whether the judge is configured, so
+        # CI can reproduce the failure even when [judge] = "none".
+        if contains is not None:
+            self._assert_contains(joined, contains)
+        if excludes is not None:
+            self._assert_excludes(joined, excludes)
+
+        # Decision #3b: fail-loud gate runs AFTER rule-based assertions
+        # pass. Codex finding (round-3 adversarial on step 2): placing the
+        # gate before recall meant `contains="missing", latest_fact_is="X"`
+        # against NoOpJudge raised JudgeUnavailableError instead of the
+        # AssertionError the user expected — that contradicted Decision #9
+        # because cheap assertions should always run first. With the gate
+        # here, the order is rule-based → gate → judge eval, which matches
+        # the documented short-circuit semantics.
         if active_judge_modes and not self._judge.capabilities().available:
             judge_kwarg = active_judge_modes[0]
             if self._judge_optional:
@@ -754,17 +775,6 @@ class MemoryContract:
                 f"@pytest.mark.recalllab_optional('judge_configured') if "
                 f"the test is genuinely optional in this environment."
             )
-
-        results = self.recall(query, k=k)
-        joined = "\n".join(r.text for r in results)
-
-        # Rule-based first (Decision #9): fail-fast on the rule-based
-        # assertions before invoking the judge. A failing rule-based
-        # assertion never spends judge cost.
-        if contains is not None:
-            self._assert_contains(joined, contains)
-        if excludes is not None:
-            self._assert_excludes(joined, excludes)
 
         if active_judge_modes:
             # Step 2 plumbing only: judge evaluation logic lands in step 4.

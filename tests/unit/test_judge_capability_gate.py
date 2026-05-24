@@ -147,6 +147,56 @@ def test_rule_based_only_calls_still_work_with_no_judge_provided() -> None:
     contract.should_recall("Where do I live?", contains="Bangalore")
 
 
+def test_combined_rule_judge_short_circuits_against_default_noop() -> None:
+    """Decision #9 must hold against the DEFAULT NoOpJudge, not just a fake.
+
+    Codex round-3 adversarial finding (HIGH): the original step-2
+    implementation placed the fail-loud gate BEFORE rule-based
+    assertions, so ``should_recall(query, contains="missing",
+    latest_fact_is="X")`` against the default NoOpJudge raised
+    ``JudgeUnavailableError`` instead of the cheap ``AssertionError``
+    the user expected. That contradicted Decision #9 (rule-first
+    short-circuit) because the fail-loud gate fired even though the
+    judge would never have been invoked.
+
+    The current implementation runs rule-based assertions first; the
+    gate only fires if all rule-based pass. This test pins that
+    ordering against the default ``NoOpJudge`` so the regression cannot
+    return.
+    """
+    contract = _new_contract(judge=NoOpJudge(), judge_optional=False)
+    contract.given_user("ayush")
+    contract.remember("I live in Bangalore.")
+    # contains="Mumbai" will fail — Mumbai is nowhere in the recall.
+    # The gate should NOT fire because the rule-based assertion fails
+    # first; the user must see AssertionError, not JudgeUnavailableError.
+    with pytest.raises(AssertionError):
+        contract.should_recall(
+            "Where do I live?",
+            contains="Mumbai",
+            latest_fact_is="Mumbai",
+        )
+    # And specifically NOT a JudgeUnavailableError — pytest.raises would
+    # accept a subclass, so guard explicitly.
+    contract2 = _new_contract(judge=NoOpJudge(), judge_optional=False)
+    contract2.given_user("ayush")
+    contract2.remember("I live in Bangalore.")
+    try:
+        contract2.should_recall(
+            "Where do I live?",
+            contains="Mumbai",
+            latest_fact_is="Mumbai",
+        )
+    except JudgeUnavailableError:  # pragma: no cover — regression guard
+        pytest.fail(
+            "fail-loud gate ran before rule-based assertion; Decision #9 "
+            "violation: combined call should have raised AssertionError "
+            "from the failing contains= check"
+        )
+    except AssertionError:
+        pass  # Expected.
+
+
 def test_combined_rule_judge_short_circuits_on_rule_failure() -> None:
     """Decision #9: failing rule-based assertion never spends judge cost.
 

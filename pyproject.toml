@@ -103,6 +103,19 @@ disallow_untyped_defs = false
 module = "examples.*"
 disallow_untyped_defs = false
 
+# The AnthropicJudge adapter ships in v0.2.2 step 4. Step 2 lazily imports
+# it from inside ``_build_judge`` and catches the ImportError to surface a
+# user-friendly "[judge] extra required / adapter not yet implemented"
+# message. mypy oscillates between "import-not-found" and "import-untyped"
+# for this path depending on whether the third-party ``anthropic`` package
+# is installed, which makes any inline ``# type: ignore[<code>]`` either
+# fail under strict or trigger ``warn_unused_ignores``. The override
+# ignores the missing import explicitly until step 4 lands the file with
+# its own typing.
+[[tool.mypy.overrides]]
+module = "recalllab.core.judge.anthropic"
+ignore_missing_imports = true
+
 [tool.pytest.ini_options]
 testpaths = ["tests", "examples/tests"]
 asyncio_mode = "auto"

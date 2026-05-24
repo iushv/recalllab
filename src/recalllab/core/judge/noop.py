@@ -34,14 +34,22 @@ class NoOpJudge(JudgeProvider):
         return JudgeCapabilities(available=False)
 
     def evaluate(self, request: JudgeRequest) -> JudgeVerdict:
-        # Should be unreachable in normal flow: the DSL gate catches
-        # unconfigured-judge calls before they get here. If we DO get
-        # here, raise the same loud error the gate would have raised so
-        # the failure mode is consistent regardless of who caught it.
+        # NoOpJudge is the default backend when ``[judge].provider =
+        # "none"``. Contracts written against
+        # ``MemoryContract.should_recall`` never reach this method
+        # because the DSL gate (see ``docs/judge-assertions.md``
+        # Decision #3b) raises a friendlier ``JudgeUnavailableError``
+        # upstream with guidance on configuring ``[judge]`` or marking
+        # the contract optional. If you're calling ``evaluate()``
+        # directly (e.g. third-party tooling that builds a
+        # ``JudgeProvider`` outside the DSL), that's unsupported by
+        # design — instantiate ``AnthropicJudge`` or another configured
+        # backend instead.
         raise JudgeUnavailableError(
-            "NoOpJudge cannot evaluate; configure [judge] in "
-            "recalllab.toml (set provider = \"anthropic\" and install the "
-            "[judge] extra). This call reached NoOpJudge.evaluate, which "
-            "means the DSL fail-loud gate was bypassed — please file an "
-            "issue against RecallLab if you see this in production."
+            "NoOpJudge cannot evaluate. Configure [judge] in "
+            "recalllab.toml (set provider = \"anthropic\" and install "
+            "the [judge] extra) to enable judge-mode assertions. "
+            "NoOpJudge.evaluate() is intentionally a no-op; the "
+            "MemoryContract DSL gate handles the user-facing error "
+            "message and should not reach this method in normal use."
         )

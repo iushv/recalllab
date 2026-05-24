@@ -66,9 +66,29 @@ _JUDGE_CAPABILITY_NAMES: frozenset[str] = frozenset(
 _KNOWN_CAPABILITY_NAMES: frozenset[str] = (
     _PROVIDER_CAPABILITY_NAMES | _JUDGE_CAPABILITY_NAMES
 )
-# Hint kept in the JudgeCapabilities import path so a static-checker sees
-# the model is actually used (the alias map references its fields by string).
-_ = JudgeCapabilities
+# Import-time sanity check: every alias target must resolve to a field
+# on JudgeCapabilities. Codex round-3 adversarial finding: without this
+# guard, a typo in the alias map (e.g. ``judge_configured -> avalable``)
+# would pass collection-time validation — which only checks alias keys —
+# and crash later at runtime inside ``_resolve_capability``. Failing at
+# import time turns the typo into a clean ``RuntimeError`` users see
+# before any test runs.
+_unknown_alias_targets = sorted(
+    {
+        target
+        for target in _JUDGE_CAPABILITY_ALIASES.values()
+        if target not in JudgeCapabilities.model_fields
+    }
+)
+if _unknown_alias_targets:
+    raise RuntimeError(
+        "recalllab pytest plugin misconfigured: "
+        "_JUDGE_CAPABILITY_ALIASES targets "
+        f"{_unknown_alias_targets!r} are not fields on JudgeCapabilities "
+        f"(known fields: {sorted(JudgeCapabilities.model_fields)!r}). "
+        "This is a RecallLab bug — please file an issue."
+    )
+del _unknown_alias_targets
 
 
 def _load_config(rootdir: Path) -> dict[str, dict[str, Any]]:
@@ -150,9 +170,7 @@ def _build_judge(config: dict[str, dict[str, Any]]) -> JudgeProvider:
             # message — slightly misleading on step 2 (the extra IS
             # installed, the code just doesn't exist) but the right message
             # for the v0.2.2 release.
-            from recalllab.core.judge.anthropic import (  # type: ignore[import-untyped]
-                AnthropicJudge,
-            )
+            from recalllab.core.judge.anthropic import AnthropicJudge
         except ImportError as exc:
             raise RuntimeError(
                 "judge.provider='anthropic' requires the [judge] extra. "
@@ -219,7 +237,14 @@ def pytest_configure(config: pytest.Config) -> None:
     )
     rl_config = _load_config(Path(config.rootpath))
     config.stash[_CONFIG_KEY] = rl_config
-    config.stash[_JUDGE_KEY] = _build_judge(rl_config)
+    # Judge construction is NOT eager — see _get_judge below. Building the
+    # judge here would crash every unrelated pytest session that has
+    # recalllab installed if the user's recalllab.toml had a typo or set
+    # provider="anthropic" before the AnthropicJudge adapter landed
+    # (Codex round-3 adversarial finding on step 2). The pytest11 entry
+    # point causes this hook to run for every pytest invocation in any
+    # project that installs recalllab; pytest_configure must stay
+    # harmless for unrelated runs.
 
 
 def pytest_collection_modifyitems(
@@ -276,6 +301,27 @@ def _trace_store(config: pytest.Config) -> TraceStore:
         store = TraceStore(rl_config["trace"]["path"])
         config.stash[_TRACE_STORE_KEY] = store
     return store
+
+
+def _get_judge(config: pytest.Config) -> JudgeProvider:
+    """Get-or-create the session-wide judge provider.
+
+    Lazy by design (Codex round-3 adversarial finding on step 2): if the
+    user has ``[judge].provider = "anthropic"`` set but the AnthropicJudge
+    adapter hasn't landed yet (or the [judge] extra isn't installed),
+    eager construction at ``pytest_configure`` time would crash every
+    pytest session that loads this plugin via pytest11 — even sessions
+    that never touch a RecallLab contract. Deferring construction here
+    contains the failure blast radius to "user wrote a contract that uses
+    memory_contract AND misconfigured [judge]," which is the only path
+    that actually depends on the judge being built.
+    """
+    judge = config.stash.get(_JUDGE_KEY, None)
+    if judge is None:
+        rl_config = config.stash[_CONFIG_KEY]
+        judge = _build_judge(rl_config)
+        config.stash[_JUDGE_KEY] = judge
+    return judge
 
 
 @pytest.hookimpl(hookwrapper=True)
@@ -337,7 +383,7 @@ def memory_contract(
     """
     config = request.config.stash[_CONFIG_KEY]
     provider_name = config["provider"].get("type", "reference")
-    judge = request.config.stash[_JUDGE_KEY]
+    judge = _get_judge(request.config)
     judge_provider_name = config["judge"].get("provider", "none")
 
     # Build the run unconditionally so capability-gated skips are also
