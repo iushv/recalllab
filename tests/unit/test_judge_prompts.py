@@ -15,6 +15,7 @@ import pytest
 from recalllab.core.judge.base import JudgeMode, JudgeRequest
 from recalllab.core.judge.prompts import (
     JUDGE_PROMPT_TEMPLATE_VERSION,
+    RECALL_RESULT_TRUNCATION_BYTES,
     build_judge_prompt,
 )
 
@@ -257,6 +258,48 @@ def test_nonce_is_short_hex() -> None:
     nonce = open_tag[len("<recall_result_"):]
     assert len(nonce) == 16
     int(nonce, 16)  # must be valid hex
+
+
+def test_short_recall_result_is_not_truncated() -> None:
+    """Below-threshold inputs pass through unchanged."""
+    short = "x" * 100  # Well under 16384.
+    _, user = build_judge_prompt(_req(recall_result=short))
+    assert "truncated" not in user
+    # Round-trips intact through the envelope.
+    open_end = user.index(">\n") + 2
+    close_start = user.rindex("\n</recall_result_")
+    parsed = json.loads(user[open_end:close_start])
+    assert parsed["recall_result"] == short
+
+
+def test_recall_result_above_threshold_is_truncated_with_marker() -> None:
+    """Codex round-1 step-6/7 finding #5: huge recall_result is
+    truncated in the prompt so a pathological input can't blow the
+    token budget even with a tiny Rubric. The truncation marker is
+    inserted so the judge sees the omission."""
+    huge = "x" * (RECALL_RESULT_TRUNCATION_BYTES + 5000)
+    _, user = build_judge_prompt(_req(recall_result=huge))
+    # The user message DOES contain the truncation marker.
+    assert "truncated" in user
+    # And the envelope's recall_result is shorter than the original.
+    open_end = user.index(">\n") + 2
+    close_start = user.rindex("\n</recall_result_")
+    parsed = json.loads(user[open_end:close_start])
+    assert len(parsed["recall_result"]) < len(huge)
+    # Same input → same truncated output (determinism).
+    _, user_again = build_judge_prompt(_req(recall_result=huge))
+    assert user == user_again
+
+
+def test_truncation_is_utf8_safe() -> None:
+    """Truncation cuts on byte boundaries; UTF-8 partial sequences at
+    the boundary should be dropped rather than raise."""
+    # Build a string with multi-byte UTF-8 right at the cap.
+    prefix_bytes = RECALL_RESULT_TRUNCATION_BYTES - 1
+    text_with_multibyte_at_edge = ("a" * prefix_bytes) + ("🎯" * 10)
+    # Should not raise.
+    _, user = build_judge_prompt(_req(recall_result=text_with_multibyte_at_edge))
+    assert "truncated" in user
 
 
 def test_non_ascii_envelope_content_round_trips() -> None:

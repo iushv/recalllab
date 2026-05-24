@@ -45,10 +45,18 @@ class Rubric(BaseModel):
     and ``fail_label`` are reflected back to the user in
     ``AssertionResult.reason`` so failure messages match the rubric's
     own vocabulary.
+
+    The length bounds are defensive (Codex round-3 deferred finding
+    #7): a runaway rubric should not be able to blow through the
+    prompt-token budget or flood the trace store. The criterion cap of
+    4096 chars is generous — typical rubrics are 1-3 sentences — and
+    label caps of 32 chars match the trace-display surface. Override
+    only if you have a documented reason (e.g. machine-generated
+    rubrics from another test layer).
     """
 
     model_config = ConfigDict(frozen=True)
 
-    criterion: str = Field(min_length=1)
-    pass_label: str = "PASS"
-    fail_label: str = "FAIL"
+    criterion: str = Field(min_length=1, max_length=4096)
+    pass_label: str = Field(default="PASS", min_length=1, max_length=32)
+    fail_label: str = Field(default="FAIL", min_length=1, max_length=32)

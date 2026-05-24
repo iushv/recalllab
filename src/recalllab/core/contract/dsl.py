@@ -48,6 +48,17 @@ if TYPE_CHECKING:
     from recalllab.adapters.base import Episode, MemoryProvider, Recalled
 
 
+def _dedupe_preserving_order(items: list[str]) -> list[str]:
+    """Return ``items`` with duplicates removed, preserving first-seen order.
+
+    Used for ``must_not_answer_as`` so caller order is preserved but
+    duplicates do not pollute the prompt-identity tuple. Stable across
+    Python versions (dict-from-keys preserves insertion order since
+    3.7).
+    """
+    return list(dict.fromkeys(items))
+
+
 class MemoryContract:
     """The DSL object passed to every contract test as the ``memory_contract`` fixture.
 
@@ -873,15 +884,28 @@ class MemoryContract:
         """Return the "expected" value to record on a judge-mode ASSERT row.
 
         For ``latest_fact_is`` / ``must_not_answer_as`` it's the literal
-        kwarg value; for ``judge_assertion`` it's the full ``Rubric``
-        model (the trace stores both labels per §Rubric class identity).
+        kwarg value (the must_not_answer_as list is deduped order-
+        preserving so duplicates don't pollute the prompt-identity tuple
+        — Codex finding #6).
+
+        For ``judge_assertion`` we store ``rubric.model_dump()`` rather
+        than the live ``Rubric`` instance. Normalizing to dict at
+        trace-record time means the SQLite round-trip and the
+        trace-to-test emitter (step 8) consume one canonical shape;
+        otherwise the emitter would have to handle both Rubric and dict
+        depending on whether the trace was just produced or just loaded
+        — Codex finding #3.
         """
         if judge_kwarg == "latest_fact_is":
             return latest_fact_is
         if judge_kwarg == "must_not_answer_as":
-            return must_not_answer_as
+            return (
+                _dedupe_preserving_order(must_not_answer_as)
+                if must_not_answer_as is not None
+                else None
+            )
         if judge_kwarg == "judge_assertion":
-            return judge_assertion
+            return judge_assertion.model_dump() if judge_assertion is not None else None
         raise RuntimeError(f"unreachable: unknown judge_kwarg {judge_kwarg!r}")
 
     @staticmethod
@@ -906,13 +930,18 @@ class MemoryContract:
         labels stay local to the trace); its ``expected`` slot is
         ``None`` — explicitly "no expected literal" rather than an
         empty-string sentinel that would mislead readers.
+
+        ``must_not_answer_as`` is deduped order-preserving so
+        ``["X", "X", "Y"]`` and ``["X", "Y"]`` produce the same
+        prompt-identity tuple and the same v0.2.3 cache key — Codex
+        finding #6.
         """
         if judge_kwarg == "latest_fact_is":
             assert latest_fact_is is not None
             return latest_fact_is
         if judge_kwarg == "must_not_answer_as":
             assert must_not_answer_as is not None
-            return must_not_answer_as
+            return _dedupe_preserving_order(must_not_answer_as)
         if judge_kwarg == "judge_assertion":
             return None
         raise RuntimeError(f"unreachable: unknown judge_kwarg {judge_kwarg!r}")
@@ -1031,8 +1060,15 @@ class MemoryContract:
         )
 
         if not verdict.passed:
+            # Rubric labels (judge_assertion mode only) are wired into
+            # the failure message so the user sees their own vocabulary
+            # in the pytest output, per the Rubric docstring promise.
+            # Other modes use the generic PASS/FAIL framing.
+            failure_label = "FAIL"
+            if judge_kwarg == "judge_assertion" and judge_assertion is not None:
+                failure_label = judge_assertion.fail_label
             raise AssertionError(
-                f"judge mode {judge_kwarg!r} returned FAIL: "
+                f"judge mode {judge_kwarg!r} returned {failure_label}: "
                 f"{verdict.reason or '(no reason supplied by judge)'}"
             )
 
