@@ -345,6 +345,42 @@ def test_unmarked_judge_call_fails_loudly(tmp_path: Path) -> None:
     assert "JudgeUnavailableError" in combined, combined
 
 
+def test_xdist_session_cap_warning_is_emitted_when_judge_configured(
+    tmp_path: Path,
+) -> None:
+    """Codex round-1 step-4 finding: the doc promises a session-start
+    warning when pytest-xdist is detected because the per-session judge
+    budget cap is enforced per-worker, not per-pytest-invocation. The
+    warning fires only when judge is actually configured — rule-based-
+    only suites have no judge cost to bound, so we don't pester users
+    who never opted into judge mode.
+
+    Skipped when pytest-xdist isn't installed (it's not a test
+    dependency); the warning code path is still unit-tested above via
+    the plugin's _build_judge no-op path.
+    """
+    try:
+        import xdist  # noqa: F401
+    except ImportError:
+        pytest.skip("pytest-xdist not installed; xdist warning untestable")
+
+    testfile = tmp_path / "test_warns.py"
+    testfile.write_text("def test_noop(memory_contract): pass\n")
+    toml = tmp_path / "recalllab.toml"
+    toml.write_text(
+        '[provider]\ntype = "reference"\n'
+        '[trace]\npath = ".recalllab/traces.sqlite"\n'
+        '[judge]\nprovider = "anthropic"\n'
+    )
+
+    result = _run_inner_pytest(testfile, extra_args=["-n", "0"])
+    combined = result.stdout + result.stderr
+    # We just need the warning string to appear; the test outcome
+    # doesn't matter (the inner test will error on missing
+    # ANTHROPIC_API_KEY but that's OK for this assertion).
+    assert "pytest-xdist detected" in combined, combined
+
+
 def test_multi_marker_honors_every_gate(tmp_path: Path) -> None:
     """A contract stacking two recalllab_optional markers honors BOTH.
 

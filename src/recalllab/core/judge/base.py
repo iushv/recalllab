@@ -54,7 +54,7 @@ class JudgeError(Exception):
 class JudgeUnavailableError(JudgeError):
     """The judge backend cannot answer.
 
-    Raised at two distinct sites:
+    Raised at three distinct sites:
 
     1. ``MemoryContract.should_recall`` when a judge-mode kwarg is used
        against an unconfigured judge (``[judge].provider = "none"``) AND
@@ -63,9 +63,49 @@ class JudgeUnavailableError(JudgeError):
        the fail-loud default from ``docs/judge-assertions.md`` Decision
        #3b: silent skip turned forgotten CI config into a green build,
        which is the exact failure mode RecallLab exists to prevent.
-    2. ``AnthropicJudge.evaluate`` on API errors, rate limits, and
-       network failures (landing in step 4).
+    2. ``AnthropicJudge.evaluate`` on the *initial* API call failing
+       (network error, rate limit, etc.) before any tokens were billed.
+       Carries no cost payload; the DSL caller does not emit a JUDGE
+       ASSERT row because no money was spent.
+    3. ``NoOpJudge.evaluate`` if reached (the DSL gate should prevent
+       this in normal flow).
+
+    When the *retry* fails after the initial call already returned
+    malformed JSON, ``AnthropicJudge`` raises
+    ``JudgePartialFailureError`` instead so the partial cost is visible
+    to the caller and lands on a failed-judge ASSERT row.
     """
+
+
+class JudgePartialFailureError(JudgeError):
+    """Retry-time API error that occurred AFTER the initial call billed.
+
+    Raised by ``AnthropicJudge.evaluate`` when the malformed-JSON retry
+    hits an API error: the initial call's tokens were charged but no
+    verdict is available. The exception carries the realized cost and
+    raw response bodies so the DSL caller can:
+
+    1. Add the cost to ``ContractRun.judge_cost_usd`` and the per-session
+       running total (the user already paid for it).
+    2. Emit a failed-judge ASSERT row with
+       ``passed=False, reason="judge_api_error: ...", cost_estimate=<partial>``,
+       matching the ``docs/judge-assertions.md`` §Failed-judge ASSERT
+       lifecycle row for "initial call returns valid JSON [or hits any
+       state past first response], retry triggered, retry API-errors."
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        cost: JudgeCostEstimate,
+        raw_responses: list[str],
+        underlying_error: Exception | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.cost = cost
+        self.raw_responses = raw_responses
+        self.underlying_error = underlying_error
 
 
 class JudgeBudgetExceededError(JudgeError):

@@ -189,7 +189,7 @@ def _build_judge(config: dict[str, dict[str, Any]]) -> JudgeProvider:
                 "you may be on a v0.2.2-in-progress branch where the "
                 "AnthropicJudge adapter has not landed yet.)"
             ) from exc
-        return AnthropicJudge(config["judge"])  # type: ignore[no-any-return]
+        return AnthropicJudge(config["judge"])
     raise ValueError(
         f"unknown judge.provider {judge_provider!r} in recalllab.toml "
         f"(supported in v0.2.2: 'none', 'anthropic')"
@@ -255,6 +255,34 @@ def pytest_configure(config: pytest.Config) -> None:
     # point causes this hook to run for every pytest invocation in any
     # project that installs recalllab; pytest_configure must stay
     # harmless for unrelated runs.
+
+    # xdist warning: the per-session judge budget cap
+    # ([judge].max_session_cost_usd) is enforced per-worker because the
+    # judge instance lives on this process's config.stash and each xdist
+    # worker is its own process. Warn the user once at session start so
+    # the effective suite cap (workers x cap) is visible — see
+    # ``docs/judge-assertions.md`` §Caveat: pytest-xdist and the session
+    # cap. Cross-worker aggregation is a v0.3 follow-up. Only warn if the
+    # user has actually configured a judge (provider != "none"); rule-
+    # based-only suites have no judge cost to bound.
+    if (
+        rl_config["judge"].get("provider", "none") != "none"
+        and config.pluginmanager.has_plugin("xdist")
+    ):
+        # Use pytest's built-in warning channel so the message appears in
+        # the session summary section, not buried in stderr.
+        config.issue_config_time_warning(
+            pytest.PytestConfigWarning(
+                "recalllab: pytest-xdist detected. "
+                "[judge].max_session_cost_usd is enforced PER WORKER "
+                f"(current cap: ${rl_config['judge'].get('max_session_cost_usd', 1.00):.2f}). "
+                "Effective suite cap is approximately N x cap for N "
+                "workers; cross-worker aggregation is a v0.3 follow-up. "
+                "If running with -n 4, set max_session_cost_usd to "
+                "(your-target / 4) to keep the suite-wide spend bounded."
+            ),
+            stacklevel=2,
+        )
 
 
 def pytest_collection_modifyitems(
