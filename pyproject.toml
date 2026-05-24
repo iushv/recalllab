@@ -38,12 +38,14 @@ dependencies = [
 langgraph = ["langgraph>=0.2"]
 mcp = ["fastmcp>=0.4"]
 dashboard = ["fastapi>=0.110", "uvicorn[standard]>=0.27", "jinja2>=3.1"]
+judge = ["anthropic>=0.40"]
 all = [
     "langgraph>=0.2",
     "fastmcp>=0.4",
     "fastapi>=0.110",
     "uvicorn[standard]>=0.27",
     "jinja2>=3.1",
+    "anthropic>=0.40",
 ]
 
 [project.scripts]
@@ -105,5 +107,5 @@ disallow_untyped_defs = false
 testpaths = ["tests", "examples/tests"]
 asyncio_mode = "auto"
 markers = [
-    "recalllab_optional: contract requires provider capabilities not present in the configured adapter",
+    "recalllab_optional: contract requires a provider or judge capability not present in the configured environment (e.g. supports_forget, judge_configured)",
 ]

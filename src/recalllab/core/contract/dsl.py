@@ -17,7 +17,15 @@ import time
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
+import pytest
+
 from recalllab.adapters.base import UnconfirmedRemoteWriteError
+from recalllab.core.judge import (
+    JudgeProvider,
+    JudgeUnavailableError,
+    NoOpJudge,
+    Rubric,
+)
 from recalllab.core.mutations import sample_distractors, validate_seed
 from recalllab.core.traces.schema import (
     AssertionResult,
@@ -39,9 +47,25 @@ class MemoryContract:
     surfaces the failure in the standard way.
     """
 
-    def __init__(self, provider: MemoryProvider, run: ContractRun) -> None:
+    def __init__(
+        self,
+        provider: MemoryProvider,
+        run: ContractRun,
+        *,
+        judge: JudgeProvider | None = None,
+        judge_optional: bool = False,
+    ) -> None:
         self._provider = provider
         self._run = run
+        # Default to NoOpJudge so the fail-loud gate in should_recall works
+        # uniformly regardless of who constructed the contract (production
+        # fixture supplies the configured judge; unit tests can pass None).
+        self._judge: JudgeProvider = judge if judge is not None else NoOpJudge()
+        # True when the contract is decorated with
+        # ``@pytest.mark.recalllab_optional("judge_configured")``; controls
+        # whether the gate skips or raises. Set by the pytest fixture; unit
+        # tests can flip it directly.
+        self._judge_optional = judge_optional
         self._user_id: str | None = None
         self._sequence = 0
         # Counter for mutation invocations, used as part of the deterministic
@@ -641,27 +665,119 @@ class MemoryContract:
         k: int = 5,
         contains: str | list[str] | None = None,
         excludes: str | list[str] | None = None,
+        latest_fact_is: str | None = None,
+        must_not_answer_as: list[str] | None = None,
+        judge_assertion: Rubric | None = None,
     ) -> list[Recalled]:
         """Run a recall and assert against the joined response text.
 
-        ``contains`` — at least one of the listed values must appear (case-insensitive)
-        in the recalled text. Vacuously ``False`` when nothing is recalled.
+        **Rule-based modes** (work with the default ``[judge].provider = "none"``):
 
-        ``excludes`` — none of the listed values may appear (case-insensitive).
-        Vacuously ``True`` when nothing is recalled.
+        - ``contains`` — at least one of the listed values must appear
+          (case-insensitive) in the recalled text. Vacuously ``False`` when
+          nothing is recalled.
+        - ``excludes`` — none of the listed values may appear (case-insensitive).
+          Vacuously ``True`` when nothing is recalled.
 
-        Both can be set in the same call; they're evaluated independently.
+        **Judge-driven modes** (require ``[judge]`` configured; v0.2.2 step 4):
+
+        - ``latest_fact_is`` — the latest fact must be present and dominant;
+          older facts may appear only as historical framing.
+        - ``must_not_answer_as`` — the response must not assert any of these
+          as the *current* state.
+        - ``judge_assertion`` — free-form ``Rubric(criterion=..., ...)`` rubric
+          escape hatch.
+
+        **Combination rules (Decision #3a + Decision #9):**
+
+        - At most one judge-mode kwarg per call. Combining two raises
+          ``ValueError`` at call time.
+        - Rule-based + judge-mode can coexist. Rule-based evaluates first
+          with fail-fast; judge runs only if all rule-based assertions
+          passed. A failing ``contains=`` + ``latest_fact_is=`` call
+          therefore never spends judge cost.
+
+        **Fail-loud default (Decision #3b):** if a judge-mode kwarg is used
+        but ``[judge]`` is unconfigured (``provider = "none"``), this raises
+        ``JudgeUnavailableError`` UNLESS the contract is decorated with
+        ``@pytest.mark.recalllab_optional("judge_configured")``, in which
+        case the call short-circuits to ``pytest.skip``.
+
+        v0.2.2 step 2 ships the signature + gate but NOT the judge
+        evaluation logic — calling a judge mode against a configured judge
+        currently raises ``NotImplementedError``. Step 4 lands the
+        ``AnthropicJudge`` adapter.
         """
-        if contains is None and excludes is None:
-            raise ValueError(
-                "should_recall() needs at least one of contains= or excludes="
+        # Decision #3a: at most one judge-mode kwarg per call.
+        active_judge_modes = [
+            name
+            for name, value in (
+                ("latest_fact_is", latest_fact_is),
+                ("must_not_answer_as", must_not_answer_as),
+                ("judge_assertion", judge_assertion),
             )
+            if value is not None
+        ]
+        if len(active_judge_modes) > 1:
+            raise ValueError(
+                "only one judge-mode kwarg per should_recall call; saw: "
+                + ", ".join(active_judge_modes)
+            )
+
+        if (
+            contains is None
+            and excludes is None
+            and not active_judge_modes
+        ):
+            raise ValueError(
+                "should_recall() needs at least one of contains=, "
+                "excludes=, latest_fact_is=, must_not_answer_as=, or "
+                "judge_assertion="
+            )
+
+        # Decision #3b: fail-loud gate for judge modes against an
+        # unconfigured judge. Runs BEFORE any recall query so contracts
+        # that error here don't accidentally write to the trace store.
+        if active_judge_modes and not self._judge.capabilities().available:
+            judge_kwarg = active_judge_modes[0]
+            if self._judge_optional:
+                pytest.skip(
+                    f"judge mode {judge_kwarg!r} used but [judge] is not "
+                    f"configured; skipping per "
+                    f"@pytest.mark.recalllab_optional('judge_configured')"
+                )
+            raise JudgeUnavailableError(
+                f"judge mode {judge_kwarg!r} used but [judge] is not "
+                f"configured. Either configure it in recalllab.toml "
+                f"(set [judge].provider = 'anthropic' and install the "
+                f"[judge] extra), or mark this contract with "
+                f"@pytest.mark.recalllab_optional('judge_configured') if "
+                f"the test is genuinely optional in this environment."
+            )
+
         results = self.recall(query, k=k)
         joined = "\n".join(r.text for r in results)
+
+        # Rule-based first (Decision #9): fail-fast on the rule-based
+        # assertions before invoking the judge. A failing rule-based
+        # assertion never spends judge cost.
         if contains is not None:
             self._assert_contains(joined, contains)
         if excludes is not None:
             self._assert_excludes(joined, excludes)
+
+        if active_judge_modes:
+            # Step 2 plumbing only: judge evaluation logic lands in step 4.
+            # The gate above already proves the judge is configured, so
+            # raising NotImplementedError here is honest — we have a
+            # capable judge but no code yet to drive it.
+            raise NotImplementedError(
+                f"judge mode {active_judge_modes[0]!r} evaluation lands "
+                f"in v0.2.2 step 4 (AnthropicJudge adapter). v0.2.2 step "
+                f"2 ships the protocol, the [judge] config wiring, and "
+                f"the fail-loud gate only."
+            )
+
         return results
 
     # ---------------------------------------------------------------- internal API

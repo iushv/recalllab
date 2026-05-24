@@ -24,9 +24,12 @@ type = "reference"            # or "langgraph_store" or "mcp" once those land
 path = ".recalllab/traces.sqlite"
 
 [judge]
-provider = "none"             # set to "anthropic" or "openai" to enable
-                              # judge-based assertion modes (latest_fact_is,
+provider = "none"             # set to "anthropic" to enable judge-based
+                              # assertion modes (latest_fact_is,
                               # must_not_answer_as, judge_assertion).
+                              # Requires the [judge] extra:
+                              #   pip install 'recalllab[judge]'
+                              # and ANTHROPIC_API_KEY in the environment.
 
 # [provider.mcp]              # populated only when provider.type = "mcp"
 # server_url = "..."
