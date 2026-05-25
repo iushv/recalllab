@@ -181,11 +181,13 @@ def test_judge_assertion_rendered_as_rubric_literal() -> None:
     assert "from recalllab import Rubric" in source
 
 
-def test_corrupt_judge_assertion_payload_drops_kwarg_and_comments() -> None:
-    """Codex round-1 step-8 finding #1: when the stored Rubric payload
-    lacks `criterion`, drop the judge kwarg from the regenerated call
-    and emit a comment. Emitting `Rubric(**{...})` would compile but
-    raise ValidationError at runtime, masking the original failure."""
+def test_corrupt_judge_assertion_payload_drops_kwarg_and_falls_back_to_recall() -> None:
+    """Codex round-1 step-8 finding #1 + round-2 confirming finding:
+    when the stored Rubric payload lacks `criterion`, drop the judge
+    kwarg, emit a comment, AND fall through to plain ``recall(...)``
+    when no other assertion kwargs remain. Emitting
+    ``should_recall(query)`` with no kwargs would crash at replay
+    because the DSL rejects it with ValueError."""
     run = _new_run(
         _build_recall_assert(
             "judge_assertion",
@@ -198,6 +200,56 @@ def test_corrupt_judge_assertion_payload_drops_kwarg_and_comments() -> None:
     assert "judge_assertion=" not in source
     # And a comment must explain the drop.
     assert "corrupt Rubric payload" in source
+    # AND the regenerated call must be plain recall(...), NOT
+    # should_recall(query) with no kwargs (which would crash at replay).
+    assert "memory_contract.recall(" in source
+    assert "memory_contract.should_recall(" not in source
+
+
+def test_corrupt_judge_assertion_with_other_kwargs_keeps_should_recall() -> None:
+    """When the trace mixes a corrupt judge_assertion with a working
+    rule-based assertion, drop the corrupt judge kwarg only and KEEP
+    should_recall with the surviving kwarg. The recall-side fallback
+    only fires when EVERY assertion kwarg got dropped."""
+    events = [
+        TraceEvent(
+            sequence=0,
+            kind=EventKind.GIVEN_USER,
+            payload={"user_id": "ayush"},
+            timestamp=_ts(),
+        ),
+        TraceEvent(
+            sequence=1,
+            kind=EventKind.RECALL,
+            payload={"query": "Where?", "k": 5, "user_id": "ayush"},
+            timestamp=_ts(),
+        ),
+        TraceEvent(
+            sequence=2,
+            kind=EventKind.ASSERT,
+            payload={"mode": "contains", "expected": "Mumbai", "passed": True},
+            timestamp=_ts(),
+        ),
+        TraceEvent(
+            sequence=3,
+            kind=EventKind.ASSERT,
+            payload={
+                "mode": "judge_assertion",
+                "expected": {"pass_label": "P", "fail_label": "F"},  # corrupt
+                "passed": True,
+            },
+            timestamp=_ts(),
+        ),
+    ]
+    source = trace_to_test_source(_new_run(events))
+    compile(source, "<emitted>", "exec")
+    # should_recall is preserved (contains kwarg still applies).
+    assert "memory_contract.should_recall('Where?', contains='Mumbai')" in source
+    # Corrupt judge_assertion is dropped with a comment.
+    assert "corrupt Rubric payload" in source
+    # And we did NOT fall through to plain recall. The only ``.recall(``
+    # appearance in the source should be inside ``should_recall(``.
+    assert source.count("memory_contract.recall(") == 0
 
 
 def test_judge_assertion_with_custom_labels_renders_full_literal() -> None:

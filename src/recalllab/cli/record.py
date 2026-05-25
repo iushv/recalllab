@@ -645,10 +645,16 @@ def _emit_should_recall(
 
     # Emit kwargs in a canonical order so byte-stability holds across
     # trace re-records: rule-based first (matching their declaration
-    # order in the DSL signature), then judge modes.
+    # order in the DSL signature), then judge modes. Track separately
+    # how many *assertion* kwargs make it into the call so the
+    # corrupt-Rubric fall-through can detect "nothing left to assert"
+    # and degrade to a plain recall rather than a should_recall with
+    # only the query (which the DSL rejects with ValueError).
+    assertion_kwarg_count = 0
     for kwarg in ("contains", "excludes", "latest_fact_is", "must_not_answer_as"):
         if kwarg in rendered_kwargs:
             args.append(f"{kwarg}={_py(rendered_kwargs[kwarg])}")
+            assertion_kwarg_count += 1
     judge_assertion_corrupt_comment: str | None = None
     if "judge_assertion" in rendered_kwargs:
         # judge_assertion stores Rubric.model_dump() (dict) on the
@@ -663,6 +669,7 @@ def _emit_should_recall(
             args.append(
                 f"judge_assertion={_emit_rubric_literal(stored_rubric)}"
             )
+            assertion_kwarg_count += 1
         else:
             judge_assertion_corrupt_comment = (
                 "    # judge_assertion ASSERT had a corrupt Rubric "
@@ -671,6 +678,26 @@ def _emit_should_recall(
                 "still runs — fix the source trace if you need the "
                 "judge assertion to replay."
             )
+
+    if assertion_kwarg_count == 0:
+        # Every assertion kwarg ended up dropped (e.g. trace has only
+        # a corrupt judge_assertion). The DSL rejects
+        # ``should_recall(query)`` with no assertion kwargs as
+        # ValueError("needs at least one of..."), so a regenerated
+        # ``should_recall(query)`` would crash on replay. Fall through
+        # to plain ``recall(...)`` + the corrupt-Rubric / unknown-mode
+        # comments so the regression preserves the recall side of the
+        # call without tripping the DSL validation gate. (Round-2
+        # confirming review on the corrupt-Rubric fallback path.)
+        if judge_assertion_corrupt_comment is not None:
+            yield judge_assertion_corrupt_comment
+        for mode, expected in unknown_modes:
+            yield (
+                f"    # original assertion mode {mode!r} not yet supported "
+                f"by the v0.2.2 emitter (expected={_py(expected)})"
+            )
+        yield from _emit_recall(recall_event)
+        return
 
     # Documenting comments for each failed assertion. Including the mode
     # in the label keeps multi-failure cases readable.
