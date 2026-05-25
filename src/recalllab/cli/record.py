@@ -47,6 +47,28 @@ from recalllab.core.traces.sqlite_store import TraceStore
 # (if unusual) payload shape.
 _UNSET: Any = object()
 
+# Modes the emitter renders into ``should_recall`` kwargs. Rule-based
+# modes are unconditional; judge modes only render when the configured
+# judge produced a verdict OR a Decision #9 placeholder (we don't drop
+# the kwarg just because the judge didn't run — that would degrade the
+# regression's fidelity to the original call).
+_RULE_BASED_MODES: frozenset[str] = frozenset({"contains", "excludes"})
+_JUDGE_MODES: frozenset[str] = frozenset(
+    {"latest_fact_is", "must_not_answer_as", "judge_assertion"}
+)
+_KNOWN_ASSERTION_MODES: frozenset[str] = _RULE_BASED_MODES | _JUDGE_MODES
+
+# Rubric defaults — values that match these are omitted from the
+# regenerated ``Rubric(...)`` literal for readability. Mirrors the
+# defaults in ``recalllab.core.judge.rubric.Rubric``; kept inline here
+# so the emitter never imports Rubric (the emitter must stay
+# dependency-light so it can run against a trace from any RecallLab
+# version).
+_RUBRIC_DEFAULTS: dict[str, str] = {
+    "pass_label": "PASS",
+    "fail_label": "FAIL",
+}
+
 
 @dataclass(frozen=True)
 class _FailedAssertion:
@@ -94,13 +116,27 @@ def _safe_comment_lines(prefix: str, body: str) -> Iterable[str]:
 
 
 # ------------------------------------------------------------------ emitter
-def trace_to_test_source(run: ContractRun) -> str:
+def trace_to_test_source(
+    run: ContractRun,
+    *,
+    optional_judge: bool = False,
+) -> str:
     """Render ``run`` as a self-contained pytest regression file.
 
-    Pure function: the same ``ContractRun`` always produces the same
-    bytes. Timestamps, latencies, and the run UUID are intentionally
-    omitted from the output so re-recording the same logical contract
-    yields identical source.
+    Pure function: the same ``(ContractRun, optional_judge)`` pair
+    always produces the same bytes. Timestamps, latencies, and the run
+    UUID are intentionally omitted from the output so re-recording the
+    same logical contract yields identical source.
+
+    ``optional_judge`` (default ``False``) controls whether the
+    generated test is decorated with
+    ``@pytest.mark.recalllab_optional("judge_configured")`` when the
+    trace contains a judge-mode assertion. Off by default per
+    Decision #3b: a judge-mode regression that lives in CI should
+    ERROR loudly when ``[judge]`` is unconfigured, not silently skip.
+    Pass ``--optional-judge`` on the CLI when you specifically want the
+    skip-with-marker behavior (e.g. running the regression locally
+    without an API key).
 
     When the trace contains a ``REMEMBER`` with a recorded
     ``episode_id``, the generated test is decorated with
@@ -135,13 +171,28 @@ def trace_to_test_source(run: ContractRun) -> str:
     """
     needs_custom_ids = _trace_needs_custom_episode_ids(run)
     has_mutations = _trace_has_mutations(run)
+    uses_judge = _trace_uses_judge(run)
+    uses_rubric = _trace_uses_rubric(run)
+    # Any marker on the test function needs ``import pytest`` in the
+    # header. Custom-id marker is unconditional when needs_custom_ids is
+    # true; the judge-configured marker only fires when the user passed
+    # --optional-judge (or its programmatic equivalent).
+    will_emit_marker = needs_custom_ids or (uses_judge and optional_judge)
     lines: list[str] = []
-    lines.extend(_emit_header(run, needs_custom_ids=needs_custom_ids))
+    lines.extend(
+        _emit_header(
+            run,
+            needs_pytest_import=will_emit_marker,
+            uses_rubric=uses_rubric,
+        )
+    )
     lines.append("")
     if needs_custom_ids:
         lines.append(
             '@pytest.mark.recalllab_optional("supports_custom_episode_ids")'
         )
+    if uses_judge and optional_judge:
+        lines.append('@pytest.mark.recalllab_optional("judge_configured")')
     lines.append("def test_recorded_failure(memory_contract) -> None:")
     body = list(_emit_body(run))
     if has_mutations:
@@ -222,6 +273,54 @@ def _trace_needs_custom_episode_ids(run: ContractRun) -> bool:
     return False
 
 
+def _iter_rendered_judge_assert_modes(run: ContractRun) -> Iterable[str]:
+    """Yield the ``mode`` string of every ASSERT that will be RENDERED.
+
+    An ASSERT is "rendered" iff it's part of a contiguous group
+    immediately following a RECALL event — exactly the set
+    ``_emit_body`` hands to ``_emit_should_recall``. Orphan ASSERTs
+    (no preceding RECALL) are emitted as comments only, so flagging
+    judge usage off them would add a spurious ``import pytest`` or
+    ``recalllab_optional("judge_configured")`` marker even though the
+    generated test never invokes a judge — Codex round-1 step-8
+    finding #2.
+    """
+    events = list(run.events)
+    i = 0
+    while i < len(events):
+        if events[i].kind != EventKind.RECALL:
+            i += 1
+            continue
+        j = i + 1
+        while j < len(events) and events[j].kind == EventKind.ASSERT:
+            mode = events[j].payload.get("mode")
+            if isinstance(mode, str):
+                yield mode
+            j += 1
+        i = max(j, i + 1)
+
+
+def _trace_uses_judge(run: ContractRun) -> bool:
+    """Return True iff a RENDERED ASSERT in the trace is judge-mode.
+
+    Used to decide whether the optional-judge marker applies and
+    whether judge-mode kwargs need to be rendered. See
+    ``_iter_rendered_judge_assert_modes`` for the pairing rationale.
+    """
+    return any(mode in _JUDGE_MODES for mode in _iter_rendered_judge_assert_modes(run))
+
+
+def _trace_uses_rubric(run: ContractRun) -> bool:
+    """Return True iff a RENDERED ASSERT in the trace is judge_assertion.
+
+    Used to decide whether ``from recalllab import Rubric`` belongs in
+    the generated test's imports.
+    """
+    return any(
+        mode == "judge_assertion" for mode in _iter_rendered_judge_assert_modes(run)
+    )
+
+
 def _trace_has_mutations(run: ContractRun) -> bool:
     """Return True iff the trace has any ``MUTATION`` event whose status
     isn't ``unsupported``.
@@ -251,7 +350,12 @@ def _body_has_statement(body: list[str]) -> bool:
     return False
 
 
-def _emit_header(run: ContractRun, *, needs_custom_ids: bool) -> Iterable[str]:
+def _emit_header(
+    run: ContractRun,
+    *,
+    needs_pytest_import: bool,
+    uses_rubric: bool,
+) -> Iterable[str]:
     """Module-level docstring + imports.
 
     User-supplied metadata (``contract_id``, ``status``) goes through
@@ -261,10 +365,12 @@ def _emit_header(run: ContractRun, *, needs_custom_ids: bool) -> Iterable[str]:
     code into the generated file — a real failure mode because pytest
     node IDs can include arbitrary parametrized id strings.
 
-    ``needs_custom_ids=True`` triggers the ``import pytest`` so the
-    ``recalllab_optional`` marker on the test function resolves. We
-    skip the import entirely otherwise to keep id-free generated tests
-    minimal (no pytest mark surface).
+    ``needs_pytest_import=True`` adds ``import pytest`` so any
+    decorator (``recalllab_optional`` for custom ids or
+    judge_configured) resolves. The caller decides based on which
+    markers will fire so this header stays minimal when no markers
+    apply. ``uses_rubric=True`` adds ``from recalllab import Rubric``
+    so the rendered ``judge_assertion=Rubric(...)`` literal resolves.
     """
     yield '"""Recorded regression generated by `recalllab record`.'
     yield ""
@@ -278,9 +384,12 @@ def _emit_header(run: ContractRun, *, needs_custom_ids: bool) -> Iterable[str]:
     yield f"# Original status:  {run.status.value!r}"
     yield ""
     yield "from __future__ import annotations"
-    if needs_custom_ids:
+    if needs_pytest_import:
         yield ""
         yield "import pytest"
+    if uses_rubric:
+        yield ""
+        yield "from recalllab import Rubric"
 
 
 # Event kinds whose DSL replay requires an active user. A
@@ -473,15 +582,17 @@ def _emit_should_recall(
 ) -> Iterable[str]:
     """Render a ``should_recall`` call from a recall + one or more asserts.
 
-    The DSL's ``should_recall(query, contains=X, excludes=Y)`` records a
-    single ``RECALL`` followed by up to two ``ASSERT`` events (one per
-    mode that was supplied). Pairing the recall with only the first
-    ASSERT — round-3 Codex finding — silently dropped the second mode,
-    so a regenerated regression could pass while the original
-    run failed on the dropped assertion. Here we gather every contiguous
-    ASSERT, combine their modes into a single rendered call, and emit
-    a documenting comment per failed assertion so the developer sees
-    each failure reason without re-running the trace.
+    The DSL's ``should_recall(query, contains=X, excludes=Y,
+    latest_fact_is=Z, must_not_answer_as=[...], judge_assertion=R)``
+    records a single ``RECALL`` followed by up to two ``ASSERT`` events
+    (a rule-based assertion plus at most one judge-mode assertion;
+    Decision #3a forbids combining two judge modes in one call). The
+    emitter gathers every contiguous ASSERT and rebuilds a single
+    ``should_recall`` call with all the kwargs the original used —
+    including the judge-mode kwarg even when the trace's ASSERT is a
+    Decision #9 short-circuit placeholder, because regenerating the
+    call WITHOUT the judge kwarg would silently degrade the
+    regression's fidelity to the original.
     """
     query = recall_event.payload.get("query", "")
     k = recall_event.payload.get("k", 5)
@@ -493,8 +604,7 @@ def _emit_should_recall(
     # same mode in one should_recall (each mode is checked once), but
     # if the trace contains duplicates we keep the *last* — the most
     # recently recorded value.
-    contains_expected: Any = _UNSET
-    excludes_expected: Any = _UNSET
+    rendered_kwargs: dict[str, Any] = {}
     unknown_modes: list[tuple[str, Any]] = []
     failed_assertions: list[_FailedAssertion] = []
 
@@ -511,10 +621,8 @@ def _emit_should_recall(
         passed: bool | None = None if passed_raw is None else bool(passed_raw)
         reason = assert_event.payload.get("reason")
         reason_text = reason if isinstance(reason, str) else None
-        if mode == "contains":
-            contains_expected = expected
-        elif mode == "excludes":
-            excludes_expected = expected
+        if mode in _KNOWN_ASSERTION_MODES:
+            rendered_kwargs[mode] = expected
         else:
             unknown_modes.append((mode, expected))
             # Don't track unknown-mode pass/fail as a "failed" assertion
@@ -523,22 +631,46 @@ def _emit_should_recall(
         if passed is False:
             failed_assertions.append(_FailedAssertion(mode, expected, reason_text))
 
-    if contains_expected is _UNSET and excludes_expected is _UNSET:
-        # Every assert was an unsupported mode (e.g. judge-driven).
-        # Emit a plain recall plus a comment per skipped assert so the
-        # developer knows what didn't get replayed.
+    if not rendered_kwargs:
+        # Every assert was an unsupported mode. Emit a plain recall
+        # plus a comment per skipped assert so the developer knows
+        # what didn't get replayed.
         for mode, expected in unknown_modes:
             yield (
                 f"    # original assertion mode {mode!r} not yet supported "
-                f"by the v0.2.1 emitter (expected={_py(expected)})"
+                f"by the v0.2.2 emitter (expected={_py(expected)})"
             )
         yield from _emit_recall(recall_event)
         return
 
-    if contains_expected is not _UNSET:
-        args.append(f"contains={_py(contains_expected)}")
-    if excludes_expected is not _UNSET:
-        args.append(f"excludes={_py(excludes_expected)}")
+    # Emit kwargs in a canonical order so byte-stability holds across
+    # trace re-records: rule-based first (matching their declaration
+    # order in the DSL signature), then judge modes.
+    for kwarg in ("contains", "excludes", "latest_fact_is", "must_not_answer_as"):
+        if kwarg in rendered_kwargs:
+            args.append(f"{kwarg}={_py(rendered_kwargs[kwarg])}")
+    judge_assertion_corrupt_comment: str | None = None
+    if "judge_assertion" in rendered_kwargs:
+        # judge_assertion stores Rubric.model_dump() (dict) on the
+        # trace's ``expected`` field; render it as a Rubric literal so
+        # the regenerated test reads naturally. When the stored shape
+        # is corrupt (no criterion), drop the kwarg entirely and
+        # surface a comment — emitting Rubric(**{...}) would compile
+        # but raise ValidationError at runtime, masking the original
+        # regression behind a misleading failure.
+        stored_rubric = rendered_kwargs["judge_assertion"]
+        if _is_renderable_rubric(stored_rubric):
+            args.append(
+                f"judge_assertion={_emit_rubric_literal(stored_rubric)}"
+            )
+        else:
+            judge_assertion_corrupt_comment = (
+                "    # judge_assertion ASSERT had a corrupt Rubric "
+                f"payload (no 'criterion' field): {_py(stored_rubric)}. "
+                "Kwarg dropped from regenerated call so the regression "
+                "still runs — fix the source trace if you need the "
+                "judge assertion to replay."
+            )
 
     # Documenting comments for each failed assertion. Including the mode
     # in the label keeps multi-failure cases readable.
@@ -556,8 +688,67 @@ def _emit_should_recall(
             f"(expected={_py(expected)})"
         )
 
+    # Decision #9 audit comment: when a judge mode was short-circuited
+    # at record time (passed=None), surface a neutral comment so a
+    # reader knows the regenerated judge kwarg won't necessarily
+    # invoke the judge (the same short-circuit will reproduce on
+    # replay). Separate from the "failed" comment above so the
+    # semantic distinction reads cleanly in the regenerated file.
+    for assert_event in assert_events:
+        if assert_event.payload.get("passed") is not None:
+            continue
+        mode = assert_event.payload.get("mode", "")
+        if mode not in _JUDGE_MODES:
+            continue
+        reason = assert_event.payload.get("reason")
+        prefix = f"original assertion short-circuited ({mode}): "
+        if isinstance(reason, str) and reason:
+            yield from _safe_comment_lines(prefix, reason)
+        else:
+            yield f"    # original assertion short-circuited ({mode})"
+
+    if judge_assertion_corrupt_comment is not None:
+        yield judge_assertion_corrupt_comment
+
     rendered = ", ".join(args)
     yield f"    memory_contract.should_recall({rendered})"
+
+
+def _is_renderable_rubric(value: Any) -> bool:
+    """Return True iff ``value`` is a dict with a non-empty ``criterion``.
+
+    Used to decide whether ``_emit_rubric_literal`` can produce a
+    valid call. A trace with a corrupt or legacy shape (no criterion)
+    triggers the fallback "drop the kwarg + emit a comment" path so
+    the regenerated test still runs, instead of compiling but raising
+    at execution time inside ``Rubric(**{...})``.
+    """
+    if not isinstance(value, dict):
+        return False
+    criterion = value.get("criterion")
+    return isinstance(criterion, str) and len(criterion) > 0
+
+
+def _emit_rubric_literal(expected: dict[str, Any]) -> str:
+    """Render a ``Rubric(...)`` literal from a trace's stored value.
+
+    ``expected`` is ``Rubric.model_dump()`` (a dict of criterion +
+    pass_label + fail_label) per the step-6+7 trace normalization.
+    Default-valued fields are omitted so the generated file stays
+    readable for the common case
+    ``judge_assertion=Rubric(criterion="...")``.
+
+    Callers must gate on :func:`_is_renderable_rubric` first; a dict
+    missing ``criterion`` raises ``KeyError`` here rather than
+    silently emitting an invalid ``Rubric(**...)`` literal that
+    would compile but crash at runtime.
+    """
+    kwargs: list[str] = [f"criterion={_py(expected['criterion'])}"]
+    for field, default in _RUBRIC_DEFAULTS.items():
+        value = expected.get(field, default)
+        if value != default:
+            kwargs.append(f"{field}={_py(value)}")
+    return f"Rubric({', '.join(kwargs)})"
 
 
 def _emit_forget(event: TraceEvent) -> Iterable[str]:
@@ -649,6 +840,7 @@ def cmd_record(
     latest_failure: bool,
     out_path: Path,
     force: bool = False,
+    optional_judge: bool = False,
 ) -> int:
     """Read one ``ContractRun`` from ``trace_path`` and write a regression test.
 
@@ -701,7 +893,7 @@ def cmd_record(
         )
         return 1
 
-    source = trace_to_test_source(run)
+    source = trace_to_test_source(run, optional_judge=optional_judge)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     _atomic_write_text(out_path, source)
     print(f"Wrote {out_path} ({len(source.splitlines())} lines).")
