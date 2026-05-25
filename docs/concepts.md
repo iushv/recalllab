@@ -40,7 +40,8 @@ Assertions are explicit about what they're testing:
   retrievable (see the forget / tenant-isolation examples).
 - ``latest_fact_is`` / ``must_not_answer_as`` / ``judge_assertion`` —
   judge-driven modes for the cases ``contains``/``excludes`` can't capture
-  precisely. Land in v0.2.x; gated on a configured ``[judge]`` section in
+  precisely. Shipped in v0.2.2 — see §Judge-driven assertions below.
+  Gated on a configured ``[judge]`` section in
   ``recalllab.toml``.
 
 ## Mutations *(v0.2.0)*
@@ -193,6 +194,141 @@ other tenants because every write goes through
 v0.1 plan (``with_paraphrases``, ``with_tenant_swap``,
 ``with_delete_reinsert``) land later in the v0.2 line once the
 trace-to-test and judge stories are in place.
+
+## Judge-driven assertions *(v0.2.2)*
+
+Rule-based ``contains`` / ``excludes`` cover literal-string expectations
+("Mumbai must appear in the recall"). They don't cover *semantic*
+ones — temporal correctness, contradiction resolution, free-form
+rubrics. v0.2.2 adds three new ``should_recall`` kwargs that escalate
+to an LLM judge when rule-based isn't enough:
+
+```python
+memory_contract.should_recall(
+    "Where do I live?",
+    latest_fact_is="Mumbai",
+)
+memory_contract.should_recall(
+    "Where do I live?",
+    must_not_answer_as=["Bangalore", "Delhi"],
+)
+from recalllab import Rubric
+memory_contract.should_recall(
+    "What did I buy?",
+    judge_assertion=Rubric(
+        criterion="The response must cite the source episode.",
+        pass_label="CITED",
+        fail_label="UNCITED",
+    ),
+)
+```
+
+### Configuration
+
+Judge modes require ``[judge]`` configured in ``recalllab.toml``:
+
+```toml
+[judge]
+provider = "anthropic"           # "none" (default) disables judge modes.
+# model = "claude-haiku-4-5-20251022"  # pinned snapshot; bump intentionally.
+# max_cost_usd = 0.10            # per-contract cap.
+# max_session_cost_usd = 1.00    # per-pytest-invocation cap.
+# always_run = false             # diagnostic mode (see below).
+```
+
+Install with the ``[judge]`` extra and set ``ANTHROPIC_API_KEY``:
+
+```bash
+pip install 'recalllab[judge]'
+export ANTHROPIC_API_KEY=sk-...
+```
+
+### Fail-loud default (Decision #3b)
+
+A judge-mode kwarg in a committed contract **fails loudly** when
+``[judge]`` isn't configured. The DSL raises
+``JudgeUnavailableError`` and pytest reports the test as ``ERROR``.
+That keeps a forgotten CI configuration visible — silent skips on
+semantic checks defeat the purpose of having the checks at all.
+
+Skip is opt-in via the marker:
+
+```python
+@pytest.mark.recalllab_optional("judge_configured")
+def test_my_contract(memory_contract):
+    ...
+```
+
+The same marker is the reason ``recalllab record`` defaults the
+``--optional-judge`` flag to off: a regenerated regression that lives
+in CI should ERROR loudly when judge isn't configured, not silently
+skip.
+
+### Combined rule + judge (Decision #9)
+
+A ``should_recall`` call can combine any number of rule-based
+kwargs (both ``contains`` and ``excludes`` may be present) with **at
+most one** judge-mode kwarg. **Rule-based evaluates first with
+fail-fast:** a failing ``contains="X"`` never spends judge cost.
+The judge-mode kwarg lands on the trace as a placeholder ASSERT
+(``passed=None, reason="short_circuited"``) so ``recalllab record``
+can faithfully regenerate the original combined call. Combining two
+judge modes in one call raises ``ValueError`` at call time
+(Decision #3a).
+
+### Diagnostic mode (always_run)
+
+Set ``[judge].always_run = true`` to run the judge **even after a
+rule-based assertion failed**. Useful for comparing judge vs
+rule-based agreement across the suite. The judge verdict never
+overrides the rule-based ``AssertionError`` for pytest reporting —
+the original failure still wins — but the judge ASSERT is recorded
+with real cost and verdict. Default is off so failed tests don't
+drain judge budget.
+
+### Cost & budget
+
+Two caps, both enforced **post-call**:
+
+- ``max_cost_usd`` bounds one ``ContractRun``.
+- ``max_session_cost_usd`` bounds one ``pytest`` invocation — this
+  is the cap that matters for CI cost protection.
+
+Worst-case overshoot per cap is one full judge invocation including
+its malformed-JSON retry. The next invocation refuses to start once
+the running total has reached the cap. Under ``pytest-xdist`` the
+session cap is **per-worker** (cross-worker aggregation is a v0.3
+follow-up); the plugin emits a session-start warning when xdist is
+detected.
+
+### Determinism & drift
+
+Prompt assembly is deterministic — same identity tuple ``(query,
+recall_results, expected, rubric, model, mode, prompt_template_version)``
+produces the same byte-identical prompt every run, including a
+deterministically-derived nonce fence (``blake2s`` of the envelope).
+**Judge verdicts are not guaranteed across provider snapshots**:
+``temperature=0`` minimizes same-snapshot variance but Anthropic may
+update the underlying weights even when the model name is pinned. Mix
+judge assertions with rule-based ones deliberately — rule-based tests
+are load-bearing, judge tests catch semantic regressions but
+introduce model-drift as a CI flake source.
+
+### Prompt-injection mitigation (not guarantee)
+
+Every user-supplied envelope field (``recall_result``, ``query``,
+``expected``, ``rubric``) is JSON-encoded inside a structured
+envelope; ``<``/``>`` are explicitly escaped on top of JSON's
+built-in escaping. A deterministically-derived nonce fence wraps the
+envelope so a hostile recall cannot pre-write a closing-tag
+injection. This protects *prompt structure* — the model still sees
+the hostile string as data and may, in principle, choose to follow
+it. Adversarial tests verify the prompt is assembled safely and that
+the verdict is stable on a fixed set of known-hostile inputs; they
+do not prove the model is unjailbreakable.
+
+For the full design rationale, locked decisions, and the §Failed-judge
+ASSERT lifecycle table, see ``docs/judge-assertions.md``.
 
 ## Trace-to-test *(v0.2.1)*
 
