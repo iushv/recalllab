@@ -1,0 +1,86 @@
+name: Release
+
+# Triggered by pushing a tag matching v*.*.* (e.g. v0.2.2, v0.3.0).
+# Builds sdist + wheel via uv, then uploads to PyPI using *trusted
+# publishing* (OIDC) — no API token, no repository secret.
+#
+# Security note: this workflow consumes ONLY the immutable pushed
+# tag ref. It does not interpolate any untrusted input
+# (github.event.issue.*, github.head_ref, commit messages, etc.) into
+# any `run:` block, so the github-actions-workflow-injection class of
+# risks does not apply here.
+#
+# One-time PyPI setup (do this BEFORE pushing the first release tag):
+#
+#   1. Open https://pypi.org/manage/account/publishing/
+#   2. Click "Add a new pending publisher"
+#   3. Fill in:
+#        PyPI Project Name:   recalllab
+#        Owner:               iushv
+#        Repository name:     recalllab
+#        Workflow filename:   release.yml
+#        Environment name:    pypi
+#   4. Save.
+#
+# After the first successful upload, the "pending" publisher becomes a
+# regular trusted publisher attached to the project. Subsequent
+# releases just require pushing a tag.
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+permissions:
+  # ``id-token: write`` is required for OIDC trusted publishing.
+  # Keep contents read-only — the workflow doesn't push back to git.
+  id-token: write
+  contents: read
+
+jobs:
+  build:
+    name: Build sdist + wheel
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+        with:
+          enable-cache: true
+
+      - name: Build
+        run: uv build
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+  publish:
+    name: Publish to PyPI
+    needs: build
+    runs-on: ubuntu-latest
+    # Bind the environment so PyPI's trusted publisher config (which
+    # also references the environment name) can validate the OIDC
+    # token. The environment doesn't need to exist with secrets —
+    # GitHub creates it on first use and trusted publishing handles
+    # auth without any.
+    environment:
+      name: pypi
+      url: https://pypi.org/project/recalllab/
+    steps:
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        # No `with:` block needed — trusted publishing reads the OIDC
+        # token from the runner and matches it against the publisher
+        # registered on PyPI. If the upload fails with a 403, double-
+        # check the trusted-publisher registration on PyPI matches
+        # this workflow's path + environment name.

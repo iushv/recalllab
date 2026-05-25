@@ -75,10 +75,10 @@ The wedge: RecallLab is **the test runner**, not the test corpus.
 ## Quickstart
 
 ```bash
-# Install (until PyPI publishing lands)
-pip install "git+https://github.com/iushv/recalllab.git"
-# For judge-driven assertion modes:
-pip install "git+https://github.com/iushv/recalllab.git#egg=recalllab[judge]"
+# Install
+pip install recalllab
+# For judge-driven assertion modes (latest_fact_is, must_not_answer_as, judge_assertion):
+pip install 'recalllab[judge]'
 
 # Scaffold tests/memory/ + recalllab.toml
 recalllab init
@@ -90,7 +90,7 @@ pytest tests/memory          #  6 passed in 0.01s
 To browse failures visually:
 
 ```bash
-pip install "recalllab[dashboard] @ git+https://github.com/iushv/recalllab.git"
+pip install 'recalllab[dashboard]'
 recalllab dashboard          # serves localhost:8080
 ```
 
