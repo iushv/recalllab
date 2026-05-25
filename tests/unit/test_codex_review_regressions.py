@@ -273,7 +273,11 @@ def test_memory_contract_remember_works_against_legacy_provider() -> None:
         provider="legacy",
         started_at=datetime.now(tz=UTC),
     )
-    contract = MemoryContract(provider, run)
+    # _LegacyProvider intentionally lacks the v0.2.0 episode_id/metadata
+    # kwargs — that's the whole point of this regression test. Suppress
+    # the Protocol mismatch so mypy doesn't fail CI on the test that
+    # specifically proves the DSL tolerates this shape.
+    contract = MemoryContract(provider, run)  # type: ignore[arg-type]
     contract.given_user("ayush")
     # Ordinary remember — caller passed no episode_id. This must NOT
     # raise. Pre-fix it raised TypeError on the very first call.

@@ -51,7 +51,7 @@ def test_user_b_cannot_see_user_a_memories(memory_contract):
     memory_contract.should_recall("What is the project codename?", excludes="Aurora")
 ```
 
-The hero examples are deterministic — `pip install recalllab && pytest` runs them green with **no API key, no Postgres, no infra**. Judge-driven assertion modes (`latest_fact_is`, `must_not_answer_as`, `judge_assertion`) are documented for v0.2.
+The hero examples are deterministic — `pip install recalllab && pytest` runs them green with **no API key, no Postgres, no infra**. Judge-driven assertion modes (`latest_fact_is`, `must_not_answer_as`, `judge_assertion`) shipped in v0.2.2 — set `[judge].provider = "anthropic"` in `recalllab.toml`, `pip install 'recalllab[judge]'`, and export `ANTHROPIC_API_KEY` to enable them. See [`docs/concepts.md`](docs/concepts.md#judge-driven-assertions-v022) for the full design.
 
 ## Why
 
@@ -67,6 +67,7 @@ RecallLab is the layer underneath the benchmark suites: a pytest plugin that tur
 | pytest-native? | no | no | no | no | **yes (`pytest11`)** |
 | Trace → regression test? | no | no | no | partial | **yes (`recalllab record`, v0.2.1)** |
 | Contract mutations? | no | no | no | no | **yes (`with_distractors`, `with_stale_repeats`, v0.2.0)** |
+| Semantic / judge assertions? | n/a (fixed rubrics) | n/a | n/a | freeform eval rules | **yes (`latest_fact_is`, `must_not_answer_as`, `judge_assertion`, v0.2.2)** |
 | Imports other benchmarks? | n/a | n/a | n/a | n/a | **yes (v0.2.x)** |
 
 The wedge: RecallLab is **the test runner**, not the test corpus.
@@ -74,8 +75,10 @@ The wedge: RecallLab is **the test runner**, not the test corpus.
 ## Quickstart
 
 ```bash
-# Install (until v0.2 lands on PyPI)
+# Install (until PyPI publishing lands)
 pip install "git+https://github.com/iushv/recalllab.git"
+# For judge-driven assertion modes:
+pip install "git+https://github.com/iushv/recalllab.git#egg=recalllab[judge]"
 
 # Scaffold tests/memory/ + recalllab.toml
 recalllab init
@@ -199,12 +202,15 @@ your tests/memory/                                 your provider
 
 **v0.2.1** — trace-to-test generation: `recalllab record --trace <path> --run-id <id> --out test.py` (or `--latest-failure`). Reads a recorded `ContractRun` from the SQLite trace store and emits a self-contained pytest regression file that replays the contract. Safe against hostile payloads (every interpolation site uses `repr()` or comment-quarantine). Recorded episode IDs round-trip into the generated test so ID-paired `forget` / capability-checked recall actually addresses the same row in the regenerated run. Atomic write via temp-file + `os.replace` with default refuse-to-overwrite; `--force` to opt in. Reference adapter is now thread-safe in-process (`threading.Lock` + `check_same_thread=False`, mirroring the round-12 LangGraph pattern). Five rounds of adversarial review.
 
+**v0.2.2** — judge-driven assertion modes: `latest_fact_is`, `must_not_answer_as`, `judge_assertion=Rubric(...)`. `AnthropicJudge` backend with `temperature=0` + model pinning + post-call budget enforcement (per-run AND per-pytest-session caps, with explicit `pytest-xdist` caveat). Fail-loud default — a judge-mode kwarg without configured `[judge]` raises `JudgeUnavailableError` so forgotten CI config doesn't silently skip semantic checks. Rule-first short-circuit means a failing `contains="X"` never spends judge cost. Deterministic prompt assembly with a `blake2s`-derived nonce fence and explicit `<`/`>` escaping. `recalllab record` extended to render judge modes as kwargs and `Rubric(...)` literals; `--optional-judge` flag adds the skip marker (default off). Three rescue rounds + four adversarial rounds against the design doc, plus per-step adversarial review against the implementation.
+
 **v0.2.x roadmap** (see [`CHANGELOG.md`](CHANGELOG.md)):
-- Judge-driven assertions: `latest_fact_is`, `must_not_answer_as`, `judge_assertion`
 - Benchmark importers: LongMemEval, LoCoMo, MemoryAgentBench → contract DSL
 - pgvector / embedding-based reference adapter
+- Verdict caching: skip the judge when ``(query, recall, expected,
+  rubric, model, mode, prompt_template_version)`` is already verdicted
 
-**Gates** — 154 tests · mypy `--strict` clean · ruff clean · CI matrix py3.11/3.12 + wheel build verification.
+**Gates** — 310 passing tests + 1 conditionally-skipped (xdist) · mypy `--strict` clean across 32 source files · ruff clean · CI matrix py3.11/3.12 + wheel build verification.
 
 ## Docs
 

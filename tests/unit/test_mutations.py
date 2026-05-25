@@ -488,7 +488,7 @@ def test_sample_distractors_rejects_none_seed() -> None:
     from recalllab.core.mutations import validate_seed
 
     with pytest.raises(TypeError, match=r"seed must be an int"):
-        validate_seed(None)  # type: ignore[arg-type]
+        validate_seed(None)
     with pytest.raises(TypeError, match=r"seed must be an int"):
         sample_distractors(3, seed=None)  # type: ignore[arg-type]
 
@@ -507,7 +507,7 @@ def test_sample_distractors_rejects_bool_seed() -> None:
     behaves like ``random.Random(1)``, which is a confusing silent coercion.
     """
     with pytest.raises(TypeError, match=r"seed must be an int"):
-        sample_distractors(3, seed=True)  # type: ignore[arg-type]
+        sample_distractors(3, seed=True)
 
 
 def test_with_distractors_rejects_none_seed() -> None:

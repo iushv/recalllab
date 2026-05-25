@@ -94,7 +94,7 @@ def test_timestamp_changes_do_not_shift_output() -> None:
     produce identical bytes, otherwise the checked-in regression
     diffs every run.
     """
-    payload = {"user_id": "ayush"}
+    payload: dict[str, object] = {"user_id": "ayush"}
     run_a = _run(events=[
         _event(0, EventKind.GIVEN_USER, payload,
                when=datetime(2026, 5, 18, 12, 0, tzinfo=UTC))
@@ -1330,15 +1330,18 @@ def test_should_recall_with_expected_as_list_renders_list_literal() -> None:
     assert "contains=['Mumbai', 'Bangalore']" in src
 
 
-def test_recall_with_unknown_assertion_mode_emits_plain_recall_and_comment() -> None:
-    """When every paired ASSERT is in an unsupported mode (e.g. judge-
-    driven modes that land in v0.2.2), the emitter falls back to plain
-    ``recall(...)`` and leaves a comment per skipped assertion.
+def test_recall_with_truly_unknown_assertion_mode_emits_plain_recall_and_comment() -> None:
+    """When every paired ASSERT is in a mode the emitter doesn't know
+    (post-v0.2.2: an arbitrary future mode the trace was recorded by a
+    newer DSL), the emitter falls back to plain ``recall(...)`` and
+    leaves a comment per skipped assertion. v0.2.2 step 8 made the
+    three judge modes supported, so a truly-unknown placeholder name
+    is used here.
     """
     run = _run(events=[
         _event(0, EventKind.RECALL, {"query": "Who is the CEO?"}),
         _event(1, EventKind.ASSERT, {
-            "mode": "latest_fact_is",
+            "mode": "some_future_mode_v999",
             "expected": "Alice",
             "passed": True,
         }),
@@ -1349,15 +1352,31 @@ def test_recall_with_unknown_assertion_mode_emits_plain_recall_and_comment() -> 
     assert "memory_contract.recall('Who is the CEO?')" in src
     assert "memory_contract.should_recall" not in src
     # A skipped-assertion comment names the original mode.
-    assert "'latest_fact_is'" in src
+    assert "'some_future_mode_v999'" in src
     assert "not yet supported" in src or "skipped by emitter" in src
 
 
-def test_recall_with_mixed_supported_and_unsupported_modes() -> None:
-    """A trace with both a supported ``contains`` and an unsupported
-    ``latest_fact_is`` ASSERT must render the supported call AND a
-    comment for the dropped one — so the developer knows the
-    regression replays the contains assertion but not the judge one.
+def test_recall_with_judge_mode_renders_should_recall() -> None:
+    """Step 8 regression: judge modes are no longer "unknown" — they
+    render as should_recall kwargs. The old behavior (plain recall +
+    comment for latest_fact_is) was correct for v0.2.1 but is wrong
+    for v0.2.2 where the modes are first-class."""
+    run = _run(events=[
+        _event(0, EventKind.RECALL, {"query": "Who is the CEO?"}),
+        _event(1, EventKind.ASSERT, {
+            "mode": "latest_fact_is",
+            "expected": "Alice",
+            "passed": True,
+        }),
+    ])
+    src = trace_to_test_source(run)
+    compile(src, "<emitted>", "exec")
+    assert "memory_contract.should_recall('Who is the CEO?', latest_fact_is='Alice')" in src
+
+
+def test_recall_with_mixed_supported_modes_renders_both() -> None:
+    """A trace with both ``contains`` and ``must_not_answer_as`` ASSERTs
+    renders both as kwargs in one should_recall (post-step-8).
     """
     run = _run(events=[
         _event(0, EventKind.RECALL, {"query": "Where do I live?"}),
@@ -1365,17 +1384,17 @@ def test_recall_with_mixed_supported_and_unsupported_modes() -> None:
             "mode": "contains", "expected": "Mumbai", "passed": True,
         }),
         _event(2, EventKind.ASSERT, {
-            "mode": "must_not_answer_as", "expected": "Bangalore",
+            "mode": "must_not_answer_as", "expected": ["Bangalore"],
             "passed": True,
         }),
     ])
     src = trace_to_test_source(run)
     compile(src, "<emitted>", "exec")
-    # Supported mode IS rendered.
     assert "contains='Mumbai'" in src
-    # Unsupported mode is documented but NOT silently dropped.
-    assert "'must_not_answer_as'" in src
-    assert "skipped by emitter" in src or "not yet supported" in src
+    assert "must_not_answer_as=['Bangalore']" in src
+    # Both in the same call — no "skipped by emitter" comment.
+    assert "skipped by emitter" not in src
+    assert "not yet supported" not in src
 
 
 # ----------------------------------- security: cross-attack and extra keys

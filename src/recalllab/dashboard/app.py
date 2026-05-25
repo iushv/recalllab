@@ -119,8 +119,11 @@ def _run_detail(run: ContractRun) -> dict[str, Any]:
     if run.finished_at is not None:
         duration_ms = (run.finished_at - run.started_at).total_seconds() * 1000
 
+    # ``passed`` is three-valued from v0.2.2: True / False / None. ``None``
+    # is a short-circuit placeholder (Decision #9) and must NOT render as
+    # a failure in the Failure Gallery — ``not a.passed`` would catch it.
     failed_assertion_seqs = {
-        a.sequence for a in run.assertions if not a.passed
+        a.sequence for a in run.assertions if a.passed is False
     }
     events_view = [
         {
@@ -153,7 +156,10 @@ def _run_detail(run: ContractRun) -> dict[str, Any]:
 
 
 def _failed_reason(run: ContractRun) -> str | None:
-    failed: list[AssertionResult] = [a for a in run.assertions if not a.passed]
+    # See _run_detail for the three-valued ``passed`` rationale.
+    failed: list[AssertionResult] = [
+        a for a in run.assertions if a.passed is False
+    ]
     if failed:
         first = failed[0]
         return first.reason or f"{first.mode}({first.expected!r})"

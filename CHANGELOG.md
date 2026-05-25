@@ -7,6 +7,116 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.2] - 2026-05-25
+
+### Added — judge-driven assertion modes
+
+- **Three new ``should_recall`` kwargs**:
+  - ``latest_fact_is="X"`` — the latest fact must be present and
+    dominant; older facts may appear only as historical framing.
+  - ``must_not_answer_as=["X", "Y"]`` — the response must not assert
+    any of the listed values as the current state.
+  - ``judge_assertion=Rubric(criterion="...", pass_label=...,
+    fail_label=...)`` — free-form rubric escape hatch with custom
+    pass/fail labels.
+- **AnthropicJudge backend.** Lazy-imported, ``temperature=0``,
+  model-pinned (default ``claude-haiku-4-5-20251022``). Strict-JSON
+  responses parsed via Pydantic with one malformed-JSON retry. Cost
+  computed from token usage with configurable per-million prices.
+- **NoOpJudge default.** ``[judge].provider = "none"`` (the default)
+  disables judge modes. Install ``recalllab[judge]`` and set
+  ``ANTHROPIC_API_KEY`` to enable.
+- **Fail-loud default (Decision #3b).** A judge-mode kwarg used
+  against an unconfigured judge raises ``JudgeUnavailableError`` —
+  pytest reports ``ERROR``, never silently skips. Skip is opt-in
+  via ``@pytest.mark.recalllab_optional("judge_configured")``.
+- **Rule-first short-circuit (Decision #9).** When ``contains`` /
+  ``excludes`` are combined with a judge mode in the same call,
+  rule-based assertions evaluate first with fail-fast. A failing
+  rule-based assertion never spends judge cost; the judge-mode
+  kwarg lands as a placeholder ASSERT (``passed=None``) so
+  ``recalllab record`` can regenerate the original call faithfully.
+- **Diagnostic mode.** ``[judge].always_run = true`` makes the judge
+  run even after a rule-based failure (for judge-vs-rule agreement
+  comparisons). The rule-based ``AssertionError`` still wins for
+  pytest reporting; the judge verdict only enriches the trace.
+- **Two cost caps.** ``[judge].max_cost_usd`` bounds one
+  ``ContractRun``; ``[judge].max_session_cost_usd`` bounds one
+  ``pytest`` invocation (the cap that matters for CI). Both
+  enforced post-call with a bounded one-invocation-plus-retry
+  overshoot. Under ``pytest-xdist`` the session cap is per-worker;
+  the plugin emits a config-time warning.
+- **Deterministic prompt assembly.** Same identity tuple ``(query,
+  recall_results, expected, rubric, model, mode,
+  prompt_template_version)`` → byte-identical prompt every run,
+  including the ``blake2s``-derived nonce fence. Verdict stability
+  across provider snapshots is explicitly NOT guaranteed.
+- **Prompt-injection mitigation.** Every user-supplied envelope
+  field is JSON-encoded with ``<``/``>`` escaping; a deterministic
+  nonce fence wraps the envelope. ``recall_result`` is truncated to
+  16 KB with a marker so a pathological recall can't blow the
+  prompt budget. Mitigation, not a guarantee — the model still sees
+  hostile content as data and may follow it.
+- **Capability resolver.** New ``judge_configured`` capability name
+  registered alongside ``supports_*``; ``recalllab_optional`` walks
+  every marker on a test (no longer ``get_closest_marker``).
+  Unknown capability names raise ``pytest.UsageError`` at
+  collection time so typos surface near the collected-items count.
+- **Trace schema additions.** ``AssertionResult.passed`` is now
+  three-valued (``bool | None``); ``None`` is the Decision #9
+  placeholder. ``ContractRun.judge_cost_usd: float`` aggregates
+  judge spend across the run (default 0.0). ``TraceEvent.cost_estimate``
+  payload schema documented for judge-mode ASSERTs; ``raw_responses``
+  stored on ASSERT ``payload`` per §Failed-judge ASSERT lifecycle.
+- **Trace-to-test emitter extension.** ``recalllab record`` renders
+  the three judge modes as ``should_recall`` kwargs;
+  ``judge_assertion`` becomes a ``Rubric(criterion=..., ...)``
+  literal with default-value omission for readability. New
+  ``--optional-judge`` CLI flag (default off) adds the
+  ``recalllab_optional("judge_configured")`` marker — off by default
+  per the fail-loud guarantee. Short-circuited judge ASSERTs land
+  as a documenting comment in the generated file.
+- **133 new tests** across the judge-mode pipeline (311 collected,
+  310 passing + 1 skipped when ``pytest-xdist`` isn't installed).
+
+### Changed
+
+- ``[judge]`` is now an optional-dependencies extra
+  (``anthropic>=0.40``) added to ``[all]``.
+- ``recalllab.toml`` scaffold dropped the ``"or openai"`` mention
+  (v0.2.2 ships Anthropic only).
+- pytest plugin: ``pytest_configure`` is harmless on unrelated
+  runs; judge construction is deferred to first fixture use so a
+  misconfigured ``[judge].provider`` only crashes a session that
+  actually uses ``memory_contract``.
+- New ``JudgeProvider`` Protocol (in this release) includes
+  ``capabilities()``, ``evaluate(request)``, plus ``model_name`` and
+  ``max_cost_usd`` properties. The DSL uses the properties to build
+  ``JudgeRequest`` and enforce the per-run cap. No external v0.2.1
+  code could have implemented this Protocol — it is new — but
+  internal third-party consumers should note the surface.
+
+### Fixed
+
+- The trace-to-test emitter no longer treats judge modes as
+  "unknown" and falls back to plain ``recall(...)``. v0.2.1
+  regression tests that relied on that behavior have been updated.
+
+### Migration notes (v0.2.1 → v0.2.2)
+
+- Existing v0.2.1 contracts continue to work unchanged. Rule-based
+  ``should_recall(contains=...)`` / ``excludes=...`` semantics are
+  identical.
+- Existing v0.2.1 traces load because new trace fields have
+  defaults: ``ContractRun.judge_cost_usd = 0.0`` and
+  ``AssertionResult.passed`` defaults are preserved.
+- **External trace consumers must update one pattern**:
+  ``AssertionResult.passed`` is now tri-state
+  (``True | False | None``). ``None`` is the Decision #9
+  short-circuit placeholder. Code that wrote ``if not assertion.passed:``
+  must change to ``if assertion.passed is False:`` to avoid
+  misclassifying placeholders as failures.
+
 ## [0.2.1] - 2026-05-20
 
 ### Added — trace-to-test generation
@@ -423,6 +533,8 @@ memory, where existing benchmarks (MemoryBench, AMB, MemoryAgentBench) are
 - **YAML form of the DSL.**
 - **pgvector / embedding-based reference adapter.**
 
-[unreleased]: https://github.com/iushv/recalllab/compare/v0.2.0...HEAD
+[unreleased]: https://github.com/iushv/recalllab/compare/v0.2.2...HEAD
+[0.2.2]: https://github.com/iushv/recalllab/compare/v0.2.1...v0.2.2
+[0.2.1]: https://github.com/iushv/recalllab/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/iushv/recalllab/releases/tag/v0.2.0
 [0.1.0]: https://github.com/iushv/recalllab/releases/tag/v0.1.0

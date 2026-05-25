@@ -181,6 +181,21 @@ def _build_parser() -> argparse.ArgumentParser:
             "half-written file."
         ),
     )
+    rec_p.add_argument(
+        "--optional-judge",
+        action="store_true",
+        help=(
+            "Decorate the generated test with "
+            "@pytest.mark.recalllab_optional('judge_configured') when "
+            "the trace contains judge-mode assertions. Default is OFF "
+            "per Decision #3b: a judge-mode regression that lives in "
+            "CI should ERROR loudly when [judge] isn't configured, not "
+            "silently skip. Turn this ON when the regenerated test is "
+            "meant to run locally without an API key, or in "
+            "environments where judge configuration is genuinely "
+            "optional."
+        ),
+    )
     return parser
 
 
@@ -202,6 +217,7 @@ def main(argv: list[str] | None = None) -> int:
             latest_failure=args.latest_failure,
             out_path=args.out,
             force=args.force,
+            optional_judge=args.optional_judge,
         )
     parser.error(f"unknown command: {args.command!r}")
     return 2  # parser.error sys.exits, but keep mypy happy.
