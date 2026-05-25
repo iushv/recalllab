@@ -92,7 +92,7 @@ def _attach_mock_client(judge: AnthropicJudge, responses: list[Any]) -> MagicMoc
     """
     mock_client = MagicMock()
     mock_client.messages.create.side_effect = responses
-    judge._client = mock_client  # type: ignore[reportPrivateUsage]
+    judge._client = mock_client
     return mock_client
 
 
@@ -307,7 +307,7 @@ def test_session_cap_blocks_next_call() -> None:
     evaluate() raises before any new API call."""
     judge = _make_judge(config={"max_session_cost_usd": 0.0001})
     # First call: input=100 / output=20 → $0.0002 — exceeds the $0.0001 cap.
-    _attach_mock_client(
+    mock_client = _attach_mock_client(
         judge,
         [_mock_response('{"verdict": "PASS", "reason": "ok"}')],
     )
@@ -318,8 +318,6 @@ def test_session_cap_blocks_next_call() -> None:
     assert judge.session_cost_usd == pytest.approx(0.0002)
 
     # Second call must refuse before issuing any new request.
-    mock_client = judge._client  # type: ignore[reportPrivateUsage]
-    assert mock_client is not None
     assert mock_client.messages.create.call_count == 1
     with pytest.raises(JudgeBudgetExceededError, match="per-session"):
         judge.evaluate(_req())
@@ -336,7 +334,7 @@ def test_session_cap_includes_retry_overshoot() -> None:
     # the in-flight invocation (incl. retry) always completes — the
     # bounded-overshoot guarantee.
     judge = _make_judge(config={"max_session_cost_usd": 0.0001})
-    _attach_mock_client(
+    mock_client = _attach_mock_client(
         judge,
         [
             _mock_response("garbage", input_tokens=100, output_tokens=20),
@@ -353,8 +351,6 @@ def test_session_cap_includes_retry_overshoot() -> None:
     # The invocation completed even though its cost ($0.000475) far
     # exceeds the $0.0001 cap. The next invocation refuses.
     assert judge.session_cost_usd > judge.max_session_cost_usd
-    mock_client = judge._client  # type: ignore[reportPrivateUsage]
-    assert mock_client is not None
     with pytest.raises(JudgeBudgetExceededError):
         judge.evaluate(_req())
     # No additional API call was issued.

@@ -359,10 +359,7 @@ def test_xdist_session_cap_warning_is_emitted_when_judge_configured(
     dependency); the warning code path is still unit-tested above via
     the plugin's _build_judge no-op path.
     """
-    try:
-        import xdist  # noqa: F401
-    except ImportError:
-        pytest.skip("pytest-xdist not installed; xdist warning untestable")
+    pytest.importorskip("xdist")
 
     testfile = tmp_path / "test_warns.py"
     testfile.write_text("def test_noop(memory_contract): pass\n")

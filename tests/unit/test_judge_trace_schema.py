@@ -48,7 +48,7 @@ def _new_run(**overrides: object) -> ContractRun:
         "status": RunStatus.PASSED,
     }
     base.update(overrides)
-    return ContractRun(**base)  # type: ignore[arg-type]
+    return ContractRun(**base)
 
 
 # -------------------------------------------------------- AssertionResult.passed
@@ -124,7 +124,7 @@ def test_dsl_short_circuit_placeholder_does_not_flip_status() -> None:
     contract = MemoryContract(provider, run, judge=NoOpJudge())
     # Use the private recorder directly — public DSL doesn't emit
     # placeholders yet (lands in step 5).
-    contract._record_assertion(  # type: ignore[reportPrivateUsage]
+    contract._record_assertion(
         passed=None,
         mode="latest_fact_is",
         expected="Mumbai",
@@ -150,7 +150,7 @@ def test_dsl_real_failure_still_flips_status() -> None:
     provider = ReferenceMemoryAdapter()
     run = _new_run()
     contract = MemoryContract(provider, run, judge=NoOpJudge())
-    contract._record_assertion(  # type: ignore[reportPrivateUsage]
+    contract._record_assertion(
         passed=False,
         mode="contains",
         expected="X",

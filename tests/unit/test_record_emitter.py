@@ -94,7 +94,7 @@ def test_timestamp_changes_do_not_shift_output() -> None:
     produce identical bytes, otherwise the checked-in regression
     diffs every run.
     """
-    payload = {"user_id": "ayush"}
+    payload: dict[str, object] = {"user_id": "ayush"}
     run_a = _run(events=[
         _event(0, EventKind.GIVEN_USER, payload,
                when=datetime(2026, 5, 18, 12, 0, tzinfo=UTC))
