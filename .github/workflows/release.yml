@@ -1,6 +1,6 @@
 name: Release
 
-# Triggered by pushing a tag matching v*.*.* (e.g. v0.2.2, v0.3.0).
+# Triggered by pushing a tag matching v*.*.* (e.g. v0.2.3, v0.3.0).
 # Builds sdist + wheel via uv, then uploads to PyPI using *trusted
 # publishing* (OIDC) — no API token, no repository secret.
 #
@@ -42,10 +42,10 @@ jobs:
     name: Build sdist + wheel
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4.2.2
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v4
+        uses: astral-sh/setup-uv@v5
         with:
           enable-cache: true
 
@@ -53,7 +53,7 @@ jobs:
         run: uv build
 
       - name: Upload artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v4.6.2
         with:
           name: dist
           path: dist/
@@ -72,7 +72,7 @@ jobs:
       url: https://pypi.org/project/recalllab/
     steps:
       - name: Download build artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v4.3.0
         with:
           name: dist
           path: dist/
