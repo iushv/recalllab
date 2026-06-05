@@ -1,10 +1,10 @@
 [project]
 name = "recalllab"
-version = "0.2.2"
+version = "0.2.3"
 description = "pytest for agent memory: turn memory expectations into pytest contracts that run in CI."
 readme = "README.md"
 requires-python = ">=3.11"
-license = "Apache-2.0"
+license = { text = "Apache-2.0" }
 authors = [
     { name = "Ayush Kumar", email = "contactayushkumarv@gmail.com" },
 ]
