@@ -84,3 +84,36 @@ jobs:
         # registered on PyPI. If the upload fails with a 403, double-
         # check the trusted-publisher registration on PyPI matches
         # this workflow's path + environment name.
+
+  github-release:
+    name: Create GitHub Release
+    # Runs only after the PyPI publish succeeds, so the GitHub Releases
+    # page never drifts ahead of (or behind) what is actually on PyPI.
+    needs: publish
+    runs-on: ubuntu-latest
+    permissions:
+      # ``gh release create`` needs write access to the repo's releases.
+      # Scoped to this job only; build/publish stay contents: read.
+      contents: write
+    steps:
+      - uses: actions/checkout@v4.2.2
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          # ``github.ref_name`` on a tag push is the bare tag (e.g.
+          # ``v0.3.0``). Read into an env var rather than interpolated
+          # into the run block to keep the no-untrusted-input property.
+          TAG: ${{ github.ref_name }}
+        # ``--verify-tag`` refuses to publish a release for a tag that
+        # does not exist. ``--generate-notes`` summarises commits since
+        # the previous tag; the curated section in CHANGELOG.md remains
+        # the source of truth for prose. Idempotent-ish: if a release
+        # for the tag already exists the step fails loudly rather than
+        # duplicating it.
+        run: |
+          gh release create "${TAG}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --title "${TAG}" \
+            --generate-notes \
+            --verify-tag

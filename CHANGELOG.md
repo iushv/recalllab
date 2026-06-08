@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.3] - 2026-06-05
+
+Packaging and CI maintenance only — no functional changes to the
+library or its public API.
+
+### Changed
+
+- **License metadata** migrated to the PEP 621 table form
+  (`license = { text = "Apache-2.0" }` → SPDX expression), clearing the
+  setuptools deprecation warning raised by modern build backends.
+
+### CI
+
+- **GitHub Actions pinned** to Node 24-compatible release versions
+  (`checkout@v4.2.2`, `setup-uv@v5`, `upload-artifact@v4.6.2`,
+  `download-artifact@v4.3.0`) so the build/publish jobs stay green on
+  the current runner images.
+- **Release workflow now cuts the GitHub Release automatically.** A new
+  `github-release` job runs after a successful PyPI publish and calls
+  `gh release create` for the pushed tag, so the Releases page can no
+  longer drift behind PyPI.
+
 ## [0.2.2] - 2026-05-25
 
 ### Added — judge-driven assertion modes
@@ -533,7 +555,8 @@ memory, where existing benchmarks (MemoryBench, AMB, MemoryAgentBench) are
 - **YAML form of the DSL.**
 - **pgvector / embedding-based reference adapter.**
 
-[unreleased]: https://github.com/iushv/recalllab/compare/v0.2.2...HEAD
+[unreleased]: https://github.com/iushv/recalllab/compare/v0.2.3...HEAD
+[0.2.3]: https://github.com/iushv/recalllab/compare/v0.2.2...v0.2.3
 [0.2.2]: https://github.com/iushv/recalllab/compare/v0.2.1...v0.2.2
 [0.2.1]: https://github.com/iushv/recalllab/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/iushv/recalllab/releases/tag/v0.2.0
