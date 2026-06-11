@@ -19,8 +19,9 @@ htmlcov/
 .mypy_cache/
 .ruff_cache/
 
-# uv / venv
-.venv/
+# uv / venv (.venv is a symlink to .venv.nosync, kept out of iCloud sync scope)
+.venv
+.venv.nosync/
 .env
 venv/
 ENV/
